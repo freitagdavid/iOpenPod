@@ -1,10 +1,23 @@
 """
 Application settings with JSON persistence.
 
-Settings are stored in the user's app data directory:
+Settings are stored in the platform-appropriate directory:
   Windows: %APPDATA%/iOpenPod/settings.json
   macOS:   ~/Library/Application Support/iOpenPod/settings.json
-  Linux:   ~/.config/iOpenPod/settings.json
+  Linux:   $XDG_CONFIG_HOME/iOpenPod/settings.json  (~/.config/iOpenPod/)
+
+User data (logs, backups) follows the same convention:
+  Windows: ~/iOpenPod/
+  macOS:   ~/Library/Application Support/iOpenPod/
+  Linux:   $XDG_DATA_HOME/iOpenPod/  (~/.local/share/iOpenPod/)
+
+Cache data (transcoded files):
+  Windows: ~/iOpenPod/cache/
+  macOS:   ~/Library/Caches/iOpenPod/
+  Linux:   $XDG_CACHE_HOME/iOpenPod/  (~/.cache/iOpenPod/)
+
+On Unix, if the legacy ~/iOpenPod directory exists it is used instead
+so existing installs keep working.
 
 The default location always acts as a bootstrap: if it contains a
 ``settings_dir`` override, the real settings are loaded/saved from
@@ -30,8 +43,59 @@ def get_version() -> str:
 
 
 def _default_data_dir() -> str:
-    """Base directory for all iOpenPod user data: ~/iOpenPod."""
-    return os.path.join(os.path.expanduser("~"), "iOpenPod")
+    """Base directory for iOpenPod user data (logs, backups).
+
+    On Linux, follows XDG Base Directory Specification:
+        $XDG_DATA_HOME/iOpenPod  (default: ~/.local/share/iOpenPod)
+    On Windows: ~/iOpenPod
+    On macOS:   ~/Library/Application Support/iOpenPod
+
+    If the legacy ~/iOpenPod directory exists on a Unix system it is used
+    instead, so existing installs keep working until the user moves it.
+    """
+    home = os.path.expanduser("~")
+    legacy = os.path.join(home, "iOpenPod")
+
+    if sys.platform == "win32":
+        return legacy
+    elif sys.platform == "darwin":
+        xdg = os.path.join(home, "Library", "Application Support", "iOpenPod")
+        return legacy if os.path.isdir(legacy) else xdg
+    else:
+        # Linux / other Unix — XDG_DATA_HOME
+        if os.path.isdir(legacy):
+            return legacy
+        base = os.environ.get(
+            "XDG_DATA_HOME", os.path.join(home, ".local", "share"),
+        )
+        return os.path.join(base, "iOpenPod")
+
+
+def _default_cache_dir() -> str:
+    """Base directory for iOpenPod cache data (transcode cache).
+
+    On Linux: $XDG_CACHE_HOME/iOpenPod  (default: ~/.cache/iOpenPod)
+    On Windows: ~/iOpenPod/cache
+    On macOS:   ~/Library/Caches/iOpenPod
+
+    If the legacy ~/iOpenPod/cache directory exists on a Unix system it
+    is used instead.
+    """
+    home = os.path.expanduser("~")
+    legacy = os.path.join(home, "iOpenPod", "cache")
+
+    if sys.platform == "win32":
+        return legacy
+    elif sys.platform == "darwin":
+        xdg = os.path.join(home, "Library", "Caches", "iOpenPod")
+        return legacy if os.path.isdir(legacy) else xdg
+    else:
+        if os.path.isdir(legacy):
+            return legacy
+        base = os.environ.get(
+            "XDG_CACHE_HOME", os.path.join(home, ".cache"),
+        )
+        return os.path.join(base, "iOpenPod")
 
 
 def _default_settings_dir() -> str:
@@ -83,7 +147,7 @@ class AppSettings:
     # Changing this moves settings storage to the new location.
     settings_dir: str = ""
 
-    # Custom transcode cache directory (empty = ~/iOpenPod/cache).
+    # Custom transcode cache directory (empty = platform default via _default_cache_dir).
     transcode_cache_dir: str = ""
 
     # Maximum transcode cache size in gigabytes.  0.0 = unlimited.
@@ -91,11 +155,11 @@ class AppSettings:
     # used entries are evicted first.
     max_cache_size_gb: float = 5.0
 
-    # Custom log directory (empty = ~/iOpenPod/logs). Covers both app logs
-    # and crash reports.
+    # Custom log directory (empty = platform default via _default_data_dir/logs).
+    # Covers both app logs and crash reports.
     log_dir: str = ""
 
-    # Custom backup directory (empty = ~/iOpenPod/backups).
+    # Custom backup directory (empty = platform default via _default_data_dir/backups).
     backup_dir: str = ""
 
     # ── Sync ────────────────────────────────────────────────────────────────

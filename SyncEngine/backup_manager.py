@@ -31,8 +31,18 @@ from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
 
-# Default backup directory
-_DEFAULT_BACKUP_DIR = os.path.join(os.path.expanduser("~"), "iOpenPod", "backups")
+# Default backup directory (XDG-aware on Linux)
+
+
+def _resolve_default_backup_dir() -> str:
+    try:
+        from settings import _default_data_dir
+        return os.path.join(_default_data_dir(), "backups")
+    except Exception:
+        return os.path.join(os.path.expanduser("~"), "iOpenPod", "backups")
+
+
+_DEFAULT_BACKUP_DIR = _resolve_default_backup_dir()
 
 # Number of worker threads for parallel I/O.
 # iPod is on USB (single bus) so diminishing returns above ~4,
@@ -567,7 +577,7 @@ class BackupManager:
             progress_callback(BackupProgress(
                 "scanning", ipod_total, ipod_total,
                 message=f"Scan complete — {len(cached_scan):,} cached, "
-                        f"{len(uncached_scan):,} hashed"
+                f"{len(uncached_scan):,} hashed"
             ))
 
         logger.info(

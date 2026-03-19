@@ -64,6 +64,25 @@ class _OutOfSpaceError(Exception):
     pass
 
 
+def _current_source_stat(pc_track) -> tuple[int, float]:
+    """Re-stat the PC source file to get its current size and mtime.
+
+    The fingerprinting phase writes the acoustic fingerprint tag back
+    into the source file (FLAC, OGG, etc.), which changes its size and
+    mtime *after* the initial scan.  If we record the pre-fingerprint
+    values in the mapping, the next sync sees a "changed" file and
+    re-copies/re-transcodes unnecessarily.
+
+    Falls back to the values from the scan if stat fails (e.g. the
+    file was on removable media that's gone).
+    """
+    try:
+        st = os.stat(pc_track.path)
+        return st.st_size, st.st_mtime
+    except OSError:
+        return pc_track.size, pc_track.mtime
+
+
 @dataclass
 class SyncProgress:
     """Progress info for sync callbacks."""
@@ -480,13 +499,18 @@ class SyncExecutor:
             info = ctx.new_track_info.get(obj_key)
             if fp and info and track.db_id != 0:
                 pc_track, ipod_dest, was_transcoded = info
+                # Re-stat the source file to capture post-fingerprint
+                # size/mtime.  The fingerprinting phase may have written
+                # the acoustic fingerprint tag back into the source file,
+                # changing its size and mtime after the initial scan.
+                source_size, source_mtime = _current_source_stat(pc_track)
                 ctx.mapping.add_track(
                     fingerprint=fp,
                     db_id=track.db_id,
                     source_format=Path(pc_track.path).suffix.lstrip("."),
                     ipod_format=ipod_dest.suffix.lstrip("."),
-                    source_size=pc_track.size,
-                    source_mtime=pc_track.mtime,
+                    source_size=source_size,
+                    source_mtime=source_mtime,
                     was_transcoded=was_transcoded,
                     source_path_hint=pc_track.relative_path,
                     art_hash=getattr(pc_track, "art_hash", None),
@@ -832,13 +856,14 @@ class SyncExecutor:
                 ctx.pc_file_paths[db_id] = str(source_path)
 
             if item.fingerprint and ipod_path:
+                source_size, source_mtime = _current_source_stat(item.pc_track)
                 ctx.mapping.add_track(
                     fingerprint=item.fingerprint,
                     db_id=db_id or 0,
                     source_format=source_path.suffix.lstrip("."),
                     ipod_format=ipod_path.suffix.lstrip("."),
-                    source_size=item.pc_track.size,
-                    source_mtime=item.pc_track.mtime,
+                    source_size=source_size,
+                    source_mtime=source_mtime,
                     was_transcoded=was_transcoded,
                     source_path_hint=item.pc_track.relative_path,
                     art_hash=getattr(item.pc_track, "art_hash", None),
@@ -949,13 +974,14 @@ class SyncExecutor:
                 fp_result = ctx.mapping.get_by_db_id(db_id) if db_id else None
                 if fp_result:
                     fp, existing = fp_result
+                    source_size, source_mtime = _current_source_stat(item.pc_track)
                     ctx.mapping.add_track(
                         fingerprint=fp,
                         db_id=db_id or 0,
                         source_format=existing.source_format,
                         ipod_format=existing.ipod_format,
-                        source_size=item.pc_track.size,
-                        source_mtime=item.pc_track.mtime,
+                        source_size=source_size,
+                        source_mtime=source_mtime,
                         was_transcoded=existing.was_transcoded,
                         source_path_hint=item.pc_track.relative_path,
                         art_hash=existing.art_hash,
@@ -1061,10 +1087,8 @@ class SyncExecutor:
                 except Exception:
                     base = ""
                 if not base:
-                    import os
-                    base = os.path.join(
-                        os.path.expanduser("~"), "iOpenPod", "cache",
-                    )
+                    from settings import _default_cache_dir
+                    base = _default_cache_dir()
                 dest_dir = str(Path(base) / "podcasts" / url_hash)
 
             try:

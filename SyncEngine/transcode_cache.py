@@ -6,7 +6,10 @@ Benefits:
 - Re-sync: If an iPod is wiped, cached files are still available.
 - Quality upgrades: Only retranscode if the source file actually changed.
 
-Cache location: ~/iOpenPod/cache/ (cross-platform, configurable via settings)
+Cache location: platform-appropriate (configurable via settings)
+  Windows: ~/iOpenPod/cache/
+  macOS:   ~/Library/Caches/iOpenPod/
+  Linux:   $XDG_CACHE_HOME/iOpenPod/ (~/.cache/iOpenPod/)
 
 Cache structure:
   index.json — Maps fingerprint:format:bitrate → CachedFile metadata
@@ -36,8 +39,18 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Default cache location
-DEFAULT_CACHE_DIR = Path.home() / "iOpenPod" / "cache"
+# Default cache location (XDG-aware on Linux)
+
+
+def _resolve_default_cache_dir() -> Path:
+    try:
+        from settings import _default_cache_dir
+        return Path(_default_cache_dir())
+    except Exception:
+        return Path.home() / "iOpenPod" / "cache"
+
+
+DEFAULT_CACHE_DIR = _resolve_default_cache_dir()
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

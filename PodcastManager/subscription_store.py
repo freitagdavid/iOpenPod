@@ -173,7 +173,7 @@ class SubscriptionStore:
 
         Episodes are downloaded here first, then copied to the iPod
         during the sync process.  Uses the transcode cache directory
-        from settings, falling back to ~/iOpenPod/cache.
+        from settings, falling back to the platform default cache directory.
         """
         import hashlib
         url_hash = hashlib.sha256(feed.feed_url.encode()).hexdigest()[:16]
@@ -183,5 +183,6 @@ class SubscriptionStore:
         except Exception:
             base = ""
         if not base:
-            base = os.path.join(os.path.expanduser("~"), "iOpenPod", "cache")
+            from settings import _default_cache_dir
+            base = _default_cache_dir()
         return os.path.join(base, "podcasts", url_hash)

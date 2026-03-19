@@ -774,9 +774,8 @@ class SettingsPage(QWidget):
           - ``str``  → rendered as a small uppercase section header
           - ``QWidget`` → added directly (usually a _SettingsCard)
         """
-        scroll = make_scroll_area(extra_css=
-            "QScrollArea > QWidget > QWidget { background: transparent; }"
-        )
+        scroll = make_scroll_area(extra_css="QScrollArea > QWidget > QWidget { background: transparent; }"
+                                  )
 
         content = QWidget()
         content.setStyleSheet("background: transparent;")
@@ -1053,7 +1052,7 @@ class SettingsPage(QWidget):
         self.transcode_cache_dir = FolderRow(
             "Transcode Cache",
             "Where transcoded files are cached to avoid re-encoding "
-            "on future syncs. Leave empty for the default (~/iOpenPod/cache).",
+            "on future syncs. Leave empty for the platform default.",
         )
         self.max_cache_size = ComboRow(
             "Max Cache Size",
@@ -1071,7 +1070,7 @@ class SettingsPage(QWidget):
         self.log_dir = FolderRow(
             "Log Location",
             "Where iOpenPod writes log files and crash reports. "
-            "Leave empty for the default (~/iOpenPod/logs). "
+            "Leave empty for the platform default. "
             "Takes effect on next launch.",
         )
         self.reset_storage_row = ActionRow(
@@ -1099,7 +1098,7 @@ class SettingsPage(QWidget):
         self.backup_dir = FolderRow(
             "Backup Location",
             "Where full device backups are stored on your PC. "
-            "Leave empty for the default (~/iOpenPod/backups).",
+            "Leave empty for the platform default.",
         )
         self.backup_before_sync = ToggleRow(
             "Backup Before Sync",
@@ -1541,9 +1540,6 @@ class SettingsPage(QWidget):
         downloader.finished_download.connect(_on_finished)
         progress.canceled.connect(downloader.terminate)
         downloader.start()
-
-        self._update_checker.result_ready.connect(_on_result)
-        self._update_checker.start()
 
     def _save_and_refresh_tools(self, *_args):
         """Save settings then refresh tool status indicators."""
