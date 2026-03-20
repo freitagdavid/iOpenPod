@@ -1447,8 +1447,6 @@ class SettingsPage(QWidget):
         )
 
         if answer != QMessageBox.StandardButton.Yes:
-            # Open the release page in the browser instead
-            QDesktopServices.openUrl(QUrl(result.release_page))
             return
 
         if not result.download_url:

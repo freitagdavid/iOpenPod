@@ -613,13 +613,14 @@ def _cmd_video(
         "-vcodec", "libx264",
         "-profile:v", "baseline", "-level", h264_level,
         "-pix_fmt", "yuv420p",
+        "-tag:v", "avc1",
         "-vf", ",".join(vf_parts),
         "-crf", str(crf), "-preset", preset,
         *bitrate_args,
         "-acodec", _best_aac_encoder(),
         "-ac", str(IPOD_MAX_CHANNELS),
         "-ar", str(IPOD_MAX_SAMPLE_RATE),
-        *_aac_quality_args(quality),
+        "-b:a", "160k",
         "-movflags", "+faststart",
         "-y", dst,
     ]
@@ -687,7 +688,7 @@ def transcode(
     out = output_dir / (base_name + ext)
     src, dst = str(source_path), str(out)
 
-    crf, preset = 23, "fast"
+    crf, preset = 23, "medium"
     normalize_sr, mono_for_spoken, smart_by_type = _read_audio_settings()
     try:
         from settings import get_settings
