@@ -25,7 +25,7 @@ from typing import Optional, Callable
 from dataclasses import dataclass, field
 from .fingerprint_diff_engine import SyncPlan, SyncItem
 from .mapping import MappingManager, MappingFile
-from .transcoder import transcode, needs_transcoding
+from .transcoder import transcode, needs_transcoding, clear_caches as _clear_transcoder_caches
 from .audio_fingerprint import get_or_compute_fingerprint
 from .itunes_prefs import protect_from_itunes
 
@@ -54,6 +54,11 @@ _DEFAULT_MUSIC_DIRS = 20
 
 class _OutOfSpaceError(Exception):
     """Raised when iPod disk space drops below the disk safety reserve."""
+    pass
+
+
+class _CancelledError(Exception):
+    """Raised when a copy/transcode detects user cancellation."""
     pass
 
 
@@ -182,11 +187,15 @@ class _SyncContext:
     new_track_info: dict[int, tuple] = field(default_factory=dict)
     pc_file_paths: dict[int, str] = field(default_factory=dict)
 
+    _cancel_recorded: bool = False
+
     def cancelled(self) -> bool:
-        """Check if the user cancelled.  Updates *result* when True."""
+        """Check if the user cancelled.  Updates *result* once."""
         if self._is_cancelled and self._is_cancelled():
-            self.result.errors.append(("cancelled", "Sync was cancelled by user"))
-            self.result.success = False
+            if not self._cancel_recorded:
+                self._cancel_recorded = True
+                self.result.errors.append(("cancelled", "Sync was cancelled by user"))
+                self.result.success = False
             return True
         return False
 
@@ -260,6 +269,7 @@ class SyncExecutor:
         4. Write database in one shot (stage 7)
         """
         self._aac_quality = aac_quality
+        _clear_transcoder_caches()
 
         ctx = _SyncContext(
             plan=plan,
@@ -294,11 +304,15 @@ class SyncExecutor:
             self._execute_rating_sync,      # Stage 6
         ]
         for stage in stages:
+            if ctx.cancelled():
+                return ctx.result
             stage(ctx)
             if not ctx.result.success:
                 return ctx.result
 
         # Stage 7: write database (one shot)
+        if ctx.cancelled():
+            return ctx.result
         if not ctx.dry_run:
             self._execute_write_and_finalize(ctx)
 
@@ -523,7 +537,19 @@ class SyncExecutor:
 
     def _execute_write_and_finalize(self, ctx: _SyncContext) -> None:
         """Stage 7: assemble final track list, write database, backpatch and finalize."""
-        ctx.progress("write_database", 0, 1, message="Writing database...")
+        # Define sub-steps so the progress bar advances smoothly through
+        # the database-write phase instead of jumping from 0% to 100%.
+        # Steps: prepare tracks → build playlists → prepare db → write artwork
+        #        → build db structure → sign db → write to iPod (+ SQLite)
+        _TOTAL_STEPS = 8
+        _step = 0
+
+        def _advance(msg: str) -> None:
+            nonlocal _step
+            ctx.progress("write_database", _step, _TOTAL_STEPS, message=msg)
+            _step += 1
+
+        _advance("Preparing tracks")
 
         all_tracks = list(ctx.tracks_by_db_id.values()) + ctx.new_tracks
 
@@ -554,24 +580,34 @@ class SyncExecutor:
         self._merge_gui_playlists(ctx)
 
         # ── Build playlists and evaluate smart playlists ──────────
+        _advance("Building playlists")
         master_playlist_name, playlists, smart_playlists = (
             self._build_and_evaluate_playlists(ctx, all_tracks)
         )
 
         try:
+            # The inner writer calls our callback to advance the bar
+            # through artwork → db structure → signing → writing.
+            def _db_progress(msg: str) -> None:
+                nonlocal _step
+                ctx.progress("write_database", _step, _TOTAL_STEPS, message=msg)
+                _step += 1
+
             db_ok = self._write_database(
                 all_tracks, pc_file_paths=ctx.pc_file_paths,
                 playlists=playlists, smart_playlists=smart_playlists,
                 master_playlist_name=master_playlist_name,
+                progress_callback=_db_progress,
             )
             if not db_ok:
                 logger.error("Database write returned failure — skipping mapping save")
-                ctx.progress("write_database", 1, 1, message="Database write FAILED")
+                ctx.progress("write_database", _TOTAL_STEPS, _TOTAL_STEPS,
+                             message="Database write FAILED")
                 ctx.result.success = False
                 ctx.result.errors.append(("database", "Database write failed"))
                 return
-            ctx.progress("write_database", 1, 1,
-                         message=f"Database written with {len(all_tracks)} tracks")
+            ctx.progress("write_database", _TOTAL_STEPS, _TOTAL_STEPS,
+                         message=f"Database written — {len(all_tracks)} tracks")
 
             # ── Backpatch: new tracks now have real db_ids ──
             self._backpatch_new_tracks(ctx)
@@ -865,16 +901,19 @@ class SyncExecutor:
                 aac_quality=ctx.aac_quality,
                 transcode_progress=transcode_cb,
                 copy_progress=copy_cb,
+                is_cancelled=ctx._is_cancelled,
             )
             return (item, success, ipod_path, was_transcoded, err_msg)
 
         workers = self._max_workers
         logger.info("Stage '%s': processing %d items with %d workers", stage_name, len(items_to_process), workers)
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
             future_to_idx: dict[Future, int] = {}
             for idx, item in items_to_process:
                 if ctx.cancelled():
+                    pool.shutdown(wait=False, cancel_futures=True)
                     return
                 fut = pool.submit(_do_copy, item, idx)
                 future_to_idx[fut] = idx
@@ -883,17 +922,21 @@ class SyncExecutor:
                 if ctx.cancelled():
                     for f in future_to_idx:
                         f.cancel()
+                    pool.shutdown(wait=False, cancel_futures=True)
                     return
 
                 idx = future_to_idx[future]
                 try:
                     item, success, ipod_path, was_transcoded, err_msg = future.result()
-                except _OutOfSpaceError as e:
-                    logger.error(str(e))
-                    ctx.result.errors.append(("storage", str(e)))
-                    ctx.result.success = False
+                except (_CancelledError, _OutOfSpaceError) as e:
+                    is_oom = isinstance(e, _OutOfSpaceError)
+                    if is_oom:
+                        logger.error(str(e))
+                        ctx.result.errors.append(("storage", str(e)))
+                        ctx.result.success = False
                     for f in future_to_idx:
                         f.cancel()
+                    pool.shutdown(wait=False, cancel_futures=True)
                     return
                 except Exception as e:
                     item = items[idx]
@@ -925,6 +968,8 @@ class SyncExecutor:
                     continue
 
                 on_success(item, ipod_path, was_transcoded)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def _execute_file_updates(self, ctx: _SyncContext) -> None:
         if not ctx.plan.to_update_file:
@@ -1522,6 +1567,7 @@ class SyncExecutor:
         aac_quality: str = "normal",
         transcode_progress: Optional[Callable[[float], None]] = None,
         copy_progress: Optional[Callable[[float], None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> tuple[bool, Optional[Path], bool, str]:
         """
         Copy or transcode a file to iPod, using cache when possible.
@@ -1569,6 +1615,7 @@ class SyncExecutor:
                         self._copy_file_chunked(
                             cached_path, final_path,
                             copy_progress,
+                            is_cancelled=is_cancelled,
                         )
                         logger.info("Used cached transcode: %s", source_path.name)
                         return True, final_path, True, ""
@@ -1594,6 +1641,7 @@ class SyncExecutor:
                 output_filename=output_filename,
                 aac_quality=aac_quality,
                 progress_callback=transcode_progress,
+                is_cancelled=is_cancelled,
             )
             if result.success and result.output_path:
                 # Copy metadata tags that ffmpeg may not have preserved
@@ -1616,7 +1664,7 @@ class SyncExecutor:
                     source_path.stem, result.output_path.suffix, dest_folder,
                 )
                 final_path = dest_folder / new_name
-                self._copy_file_chunked(result.output_path, final_path, copy_progress)
+                self._copy_file_chunked(result.output_path, final_path, copy_progress, is_cancelled=is_cancelled)
 
                 # Clean up temp dir for non-fingerprinted tracks
                 if not fingerprint:
@@ -1637,7 +1685,7 @@ class SyncExecutor:
             new_name = self._generate_ipod_filename(source_path.stem, source_path.suffix, dest_folder)
             dest_path = dest_folder / new_name
             try:
-                self._copy_file_chunked(source_path, dest_path, copy_progress)
+                self._copy_file_chunked(source_path, dest_path, copy_progress, is_cancelled=is_cancelled)
                 return True, dest_path, False, ""
             except Exception as e:
                 logger.error("Copy failed: %s", e)
@@ -1648,12 +1696,22 @@ class SyncExecutor:
         src: Path, dst: Path,
         progress: Optional[Callable[[float], None]] = None,
         chunk_size: int = 256 * 1024,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> None:
         """Copy *src* to *dst* in chunks, calling *progress(0.0‒1.0)* periodically."""
         total = src.stat().st_size
         copied = 0
         with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
             while True:
+                if is_cancelled and is_cancelled():
+                    # Clean up partial file
+                    fdst.close()
+                    fsrc.close()
+                    try:
+                        dst.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise _CancelledError()
                 buf = fsrc.read(chunk_size)
                 if not buf:
                     break
@@ -1867,6 +1925,7 @@ class SyncExecutor:
         playlists: Optional[list[PlaylistInfo]] = None,
         smart_playlists: Optional[list[PlaylistInfo]] = None,
         master_playlist_name: str = "iPod",
+        progress_callback: Optional[Callable[[str], None]] = None,
     ) -> bool:
         """Write tracks to iTunesDB (and ArtworkDB/SQLite if applicable)."""
         from ._db_io import write_database
@@ -1876,4 +1935,5 @@ class SyncExecutor:
             playlists=playlists,
             smart_playlists=smart_playlists,
             master_playlist_name=master_playlist_name,
+            progress_callback=progress_callback,
         )

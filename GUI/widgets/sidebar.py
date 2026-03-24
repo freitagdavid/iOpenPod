@@ -309,9 +309,10 @@ class DeviceInfoCard(QFrame):
         """Cancel the rename and restore the original label."""
         if self._rename_edit is None:
             return
-        self._rename_edit.hide()
-        self._rename_edit.deleteLater()
-        self._rename_edit = None
+        edit = self._rename_edit
+        self._rename_edit = None  # clear before hide() to prevent re-entrant call via focus_lost
+        edit.hide()
+        edit.deleteLater()
         self.name_label.show()
 
     def _finish_rename(self):

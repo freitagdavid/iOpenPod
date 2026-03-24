@@ -4,6 +4,9 @@ import logging
 import logging.handlers
 import traceback
 
+# Prevent macOS from creating ._AppleDouble resource fork files on FAT32 iPods
+os.environ.setdefault("COPYFILE_DISABLE", "1")
+
 
 def _get_log_dir() -> str:
     """Get log directory, defaulting to platform-appropriate location."""
@@ -179,7 +182,8 @@ def run_pyqt_app():
     # QApplication exists so system-theme detection works).
     from settings import get_settings
     _s = get_settings()
-    Colors.apply_theme(_s.theme, _s.high_contrast)
+    from GUI.styles import resolve_accent_color
+    Colors.apply_theme(_s.theme, _s.high_contrast, resolve_accent_color(_s.accent_color))
     Metrics.apply_font_scale(_s.font_scale)
 
     # Build a palette from the active Colors and apply it.

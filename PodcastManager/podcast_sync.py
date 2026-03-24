@@ -486,7 +486,13 @@ def build_podcast_managed_plan(
         # ── Fill phase: pick episodes for empty slots ─────────────────
         slots_after_clear = len(staying)
         slots_to_fill = max(0, feed.episode_slots - slots_after_clear)
-        candidates = _pick_candidates(feed, staying_guids, slots_to_fill)
+
+        # In "replace" mode we also need candidates to swap with cleared
+        # episodes, even when slots are full (no empty slots).
+        candidate_count = slots_to_fill
+        if feed.clear_method == "replace" and len(to_clear) > candidate_count:
+            candidate_count = len(to_clear)
+        candidates = _pick_candidates(feed, staying_guids, candidate_count)
 
         # ── Apply clear method ────────────────────────────────────────
         # "remove"  → remove cleared episodes unconditionally
@@ -509,10 +515,12 @@ def build_podcast_managed_plan(
                         f"(replaced)"
                     ),
                 ))
-            # Add only as many candidates as we have room for
-            # (paired replacements + any remaining empty slots)
-            remaining_slots = slots_to_fill - paired
-            add_count = paired + max(0, remaining_slots)
+            # Add the paired replacements, plus any truly empty slots.
+            # Un-removed to_clear episodes still occupy slots, so count
+            # them when calculating remaining room.
+            on_ipod_after = len(on_ipod) - paired  # still on device
+            extra_room = max(0, feed.episode_slots - on_ipod_after)
+            add_count = paired + extra_room
             for candidate in candidates[:add_count]:
                 pc_track = episode_to_pc_track(candidate, feed, store)
                 feed_adds.append(SyncItem(
@@ -551,10 +559,14 @@ def build_podcast_managed_plan(
         # Also cap total on-iPod count to episode_slots even if nothing
         # was cleared (e.g. user reduced slot count after initial sync).
         # Remove oldest-added episodes that exceed the slot limit.
-        total_staying = len(staying) + len(feed_adds) - len(feed_removes)
-        if total_staying > feed.episode_slots:
-            overflow = total_staying - feed.episode_slots
-            # Sort staying by date_added ascending (oldest first) to trim
+        # Use on_ipod (not staying) as the base so that un-removed
+        # to_clear episodes in "replace" mode are counted correctly.
+        total_after = len(on_ipod) - len(feed_removes) + len(feed_adds)
+        if total_after > feed.episode_slots:
+            overflow = total_after - feed.episode_slots
+            # Sort staying by date_added ascending (oldest first) to trim.
+            # Only trim from staying — to_clear episodes already had their
+            # chance to be removed in the clear phase above.
             staying_sorted = sorted(
                 staying, key=lambda x: x[1].get("date_added", 0),
             )

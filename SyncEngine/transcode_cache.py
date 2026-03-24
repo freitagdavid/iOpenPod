@@ -534,7 +534,7 @@ class TranscodeCache:
             return False
         try:
             dest_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(cached, dest_path)
+            shutil.copyfile(cached, dest_path)
             logger.debug("Copied from cache: %s → %s", cached.name, dest_path)
             return True
         except Exception as exc:

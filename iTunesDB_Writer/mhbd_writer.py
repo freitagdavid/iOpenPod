@@ -66,7 +66,7 @@ import shutil
 import time
 import logging
 import zlib
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from .mhlt_writer import write_mhlt
 from .mhsd_writer import (
@@ -594,6 +594,7 @@ def write_itunesdb(
     smart_playlists: Optional[List[PlaylistInfo]] = None,
     capabilities: Optional[DeviceCapabilities] = None,
     master_playlist_name: str = "iPod",
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """
     Write a complete iTunesDB to an iPod.
@@ -627,6 +628,12 @@ def write_itunesdb(
         True if successful
     """
     from device_info import resolve_itdb_path, itdb_write_filename
+
+    def _progress(msg: str) -> None:
+        if progress_callback is not None:
+            progress_callback(msg)
+
+    _progress("Preparing database")
 
     # Determine the correct database filename for this device (iTunesDB or iTunesCDB)
     db_filename = itdb_write_filename(ipod_path)
@@ -765,6 +772,7 @@ def write_itunesdb(
     # --- Write ArtworkDB if PC file paths provided ---
     pending_artwork = None  # PendingArtworkWrite if defer_commit used
     if pc_file_paths:
+        _progress("Writing artwork")
         logger.debug("ART: pc_file_paths has %d entries, tracks has %d tracks",
                      len(pc_file_paths), len(tracks))
 
@@ -849,8 +857,11 @@ def write_itunesdb(
         except Exception as e:
             logger.error("ART: ArtworkDB write failed: %s", e, exc_info=True)
     else:
+        _progress("Skipping artwork (no sources)")
         logger.debug("ART: pc_file_paths is %s — skipping ArtworkDB",
                      'None' if pc_file_paths is None else 'empty dict')
+
+    _progress("Building database structure")
 
     # Extract preserved MHSD blobs (Genius data, types 6+) from existing database
     preserved_blobs: list[bytes] = []
@@ -888,6 +899,8 @@ def write_itunesdb(
                     uncompressed_size, len(cdb_buf))
         # All subsequent checksum code must operate on the compressed buffer
         itdb_data = cdb_buf
+
+    _progress("Signing database")
 
     # Detect checksum type (or use forced type)
     # Use reference or existing database as the source for hash extraction
@@ -1078,6 +1091,8 @@ def write_itunesdb(
                     shutil.copy2(_bpath, _bpath + ".backup")
                 except Exception as e:
                     logger.warning("Could not backup %s: %s", os.path.basename(_bpath), e)
+
+    _progress("Writing to iPod")
 
     # Write atomically — os.replace is atomic on NTFS and POSIX
     temp_path = itdb_path + ".tmp"

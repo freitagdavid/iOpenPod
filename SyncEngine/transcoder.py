@@ -85,6 +85,13 @@ class TranscodeResult:
         return self.source_path.suffix.lstrip(".")
 
 
+def clear_caches() -> None:
+    """Clear cached settings/binary lookups. Call at the start of each sync."""
+    _find_ffprobe.cache_clear()
+    _read_prefer_lossy.cache_clear()
+    _read_audio_settings.cache_clear()
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Binary discovery
 # ═══════════════════════════════════════════════════════════════════════════
@@ -124,6 +131,7 @@ def is_ffmpeg_available() -> bool:
     return find_ffmpeg() is not None
 
 
+@lru_cache(maxsize=1)
 def _find_ffprobe() -> Optional[str]:
     """Locate ffprobe (sibling of ffmpeg, then PATH)."""
     ffmpeg = find_ffmpeg()
@@ -300,6 +308,7 @@ def _probe_duration_us(filepath: str | Path) -> int:
 # Target resolution — "what should this file become?"
 # ═══════════════════════════════════════════════════════════════════════════
 
+@lru_cache(maxsize=1)
 def _read_prefer_lossy() -> bool:
     try:
         from settings import get_settings
@@ -308,6 +317,7 @@ def _read_prefer_lossy() -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
 def _read_audio_settings() -> tuple[bool, bool, bool]:
     """Return ``(normalize_sample_rate, mono_for_spoken, smart_quality_by_type)``
     from settings, with safe defaults if settings are unavailable."""
@@ -639,6 +649,7 @@ def transcode(
     progress_callback: Optional[Callable[[float], None]] = None,
     *,
     prefer_lossy: Optional[bool] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> TranscodeResult:
     """Transcode (or copy) *source_path* into *output_dir*.
 
@@ -720,7 +731,8 @@ def transcode(
     else:
         cmd = _cmd_video(ffmpeg, src, dst, effective_quality, crf, preset)
 
-    return _run_transcode(cmd, source_path, out, target, progress_callback)
+    return _run_transcode(cmd, source_path, out, target, progress_callback,
+                          is_cancelled=is_cancelled)
 
 
 def _run_transcode(
@@ -729,6 +741,7 @@ def _run_transcode(
     output_path: Path,
     target: TranscodeTarget,
     progress_callback: Optional[Callable[[float], None]],
+    is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> TranscodeResult:
     """Run an ffmpeg command and return a TranscodeResult."""
     try:
@@ -739,15 +752,32 @@ def _run_transcode(
             dur = _probe_duration_us(source_path)
             returncode, stderr = _run_ffmpeg_with_progress(
                 cmd, dur, progress_callback, timeout,
+                is_cancelled=is_cancelled,
             )
             progress_callback(1.0)
         else:
-            r = subprocess.run(
-                cmd, capture_output=True, text=True,
-                encoding="utf-8", errors="replace",
-                timeout=timeout, **_SP_KWARGS,
+            # Audio transcodes: run via Popen so we can kill on cancel
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                **_SP_KWARGS,
             )
-            returncode, stderr = r.returncode, r.stderr
+            # Poll so we can check cancellation every 0.5s
+            while proc.poll() is None:
+                if is_cancelled and is_cancelled():
+                    proc.kill()
+                    proc.wait(timeout=5)
+                    return TranscodeResult(
+                        success=False, source_path=source_path,
+                        output_path=None, target_format=target,
+                        was_transcoded=True, error_message="Cancelled",
+                    )
+                try:
+                    proc.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    pass
+            _, stderr_raw = proc.communicate(timeout=30)
+            returncode = proc.returncode
+            stderr = stderr_raw.decode("utf-8", errors="replace") if isinstance(stderr_raw, bytes) else str(stderr_raw)
 
         if returncode != 0:
             return TranscodeResult(
@@ -785,6 +815,7 @@ def _run_ffmpeg_with_progress(
     duration_us: int,
     progress_callback: Callable[[float], None],
     timeout: int,
+    is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> tuple[int, str]:
     """Run ffmpeg with ``-progress pipe:1`` and stream progress."""
     import threading
@@ -812,6 +843,10 @@ def _run_ffmpeg_with_progress(
         deadline = time.monotonic() + timeout
         assert proc.stdout is not None
         for line in proc.stdout:
+            if is_cancelled and is_cancelled():
+                proc.kill()
+                t.join(timeout=5)
+                return -1, "Cancelled"
             if time.monotonic() > deadline:
                 proc.kill()
                 return -1, "Transcoding timed out"

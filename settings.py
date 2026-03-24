@@ -242,6 +242,10 @@ class AppSettings:
     # Font scale factor: "75%", "90%", "100%", "110%", "125%", "150%".
     font_scale: str = "100%"
 
+    # Accent color: "blue" (default theme accent), "match-ipod" (use the
+    # connected iPod's body color), or a hex string like "#e34060".
+    accent_color: str = "blue"
+
     # Remembered window dimensions (not exposed in settings UI).
     window_width: int = 1280
     window_height: int = 720

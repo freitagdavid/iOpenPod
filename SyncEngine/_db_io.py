@@ -8,7 +8,7 @@ import logging
 import os
 import struct
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from iTunesDB_Writer.mhit_writer import TrackInfo
 from iTunesDB_Writer.mhyp_writer import PlaylistInfo
@@ -118,6 +118,7 @@ def write_database(
     playlists: Optional[list[PlaylistInfo]] = None,
     smart_playlists: Optional[list[PlaylistInfo]] = None,
     master_playlist_name: str = "iPod",
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """Write tracks to iTunesDB (and ArtworkDB if pc_file_paths provided).
 
@@ -161,6 +162,7 @@ def write_database(
             smart_playlists=smart_playlists,
             capabilities=capabilities,
             master_playlist_name=master_playlist_name,
+            progress_callback=progress_callback,
         )
     except Exception as e:
         logger.exception("Failed to write iTunesDB: %s", e)
@@ -173,6 +175,8 @@ def write_database(
     itlp_dir = os.path.join(str(ipod_path), "iPod_Control", "iTunes", "iTunes Library.itlp")
     has_itlp = os.path.isdir(itlp_dir)
     if (capabilities and capabilities.uses_sqlite_db) or has_itlp:
+        if progress_callback is not None:
+            progress_callback("Writing SQLite databases")
         logger.info("Writing SQLite databases to iTunes Library.itlp/ "
                     "(uses_sqlite_db=%s, itlp_exists=%s)",
                     capabilities.uses_sqlite_db if capabilities else False,

@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QPoint
+from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QPoint, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap, QImage, QIcon, QColor, QCursor, QKeyEvent, QWheelEvent, QMouseEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -407,6 +407,8 @@ class MusicBrowserList(QFrame):
     Uses incremental loading for large datasets (>500 tracks) to maintain
     UI responsiveness. Robust against rapid user interactions.
     """
+
+    remove_from_ipod_requested = pyqtSignal(list)
 
     def __init__(self):
         super().__init__()
@@ -882,6 +884,7 @@ class MusicBrowserList(QFrame):
         self._load_id += 1
         self._pending_rows = []
         self._is_populating = False
+        self._art_pending.clear()
 
     def _populate_table(self) -> None:
         """Populate the table with current tracks."""
@@ -1167,9 +1170,11 @@ class MusicBrowserList(QFrame):
         """Background worker: decode artwork for a batch of mhiiLinks.
 
         Returns dict mapping mhiiLink -> (width, height, rgba_bytes) or None.
+        Uses decode-only path (no color extraction) since the list view
+        only needs the thumbnail pixmap.
         """
         from ..app import DeviceManager
-        from ..imgMaker import find_image_by_img_id, get_artworkdb_cached
+        from ..imgMaker import decode_image_by_img_id, get_artworkdb_cached
         import os
 
         device = DeviceManager.get_instance()
@@ -1187,9 +1192,8 @@ class MusicBrowserList(QFrame):
         for link in links:
             if device.cancellation_token.is_cancelled():
                 break
-            result = find_image_by_img_id(artworkdb_data, artwork_folder, link, img_id_index)
-            if result is not None:
-                pil_img, _dcol, _album_colors = result
+            pil_img = decode_image_by_img_id(artworkdb_data, artwork_folder, link, img_id_index)
+            if pil_img is not None:
                 pil_img = pil_img.convert("RGBA")
                 results[link] = (pil_img.width, pil_img.height, pil_img.tobytes("raw", "RGBA"))
             else:
@@ -1207,6 +1211,7 @@ class MusicBrowserList(QFrame):
 
         try:
             # Convert to QPixmaps and cache
+            new_links: set[int] = set()
             for link, data in results.items():
                 self._art_pending.discard(link)
                 if data is None:
@@ -1222,25 +1227,40 @@ class MusicBrowserList(QFrame):
                     transform_mode=Qt.TransformationMode.SmoothTransformation,
                 )
                 self._art_cache[link] = pixmap
+                new_links.add(link)
 
-            # Backfill rows
+            if not new_links:
+                return
+
+            # Build row-index: link -> rows needing backfill (O(N) once)
+            link_to_rows: dict[int, list[int]] = {}
             for row in range(self.table.rowCount()):
                 item = self.table.item(row, 0)
                 if item is None:
                     continue
                 link = item.data(Qt.ItemDataRole.UserRole)
-                if link:
+                if link is not None:
                     try:
                         link = int(link)
                     except (ValueError, TypeError):
                         continue
-                    if link in self._art_cache:
-                        item.setIcon(QIcon(self._art_cache[link]))
-                        # Optional: Force the table to repaint this row to ensure it shows up immediately
-                        vp = self.table.viewport()
-                        if vp:
-                            vp.update()
-                        item.setData(Qt.ItemDataRole.UserRole, None)  # Clear pending marker
+                    if link in new_links:
+                        link_to_rows.setdefault(link, []).append(row)
+
+            # Apply icons using the index (O(K) where K = matched rows)
+            for link, rows in link_to_rows.items():
+                pixmap = self._art_cache[link]
+                icon = QIcon(pixmap)
+                for row in rows:
+                    item = self.table.item(row, 0)
+                    if item is not None:
+                        item.setIcon(icon)
+                        item.setData(Qt.ItemDataRole.UserRole, None)
+
+            # Single repaint after all icons are set
+            vp = self.table.viewport()
+            if vp:
+                vp.update()
 
         except RuntimeError:
             pass  # Widget deleted
@@ -1447,7 +1467,7 @@ class MusicBrowserList(QFrame):
                     "year", "track_number", "total_tracks",
                     "disc_number", "total_discs", "compilation_flag", "bpm",
                 ]),
-                ("Playback & Stats", [
+                ("Playback && Stats", [
                     "length", "rating", "play_count_1", "play_count_2",
                     "skip_count", "last_played", "last_skipped",
                     "checked_flag", "not_played_flag",
@@ -1464,7 +1484,7 @@ class MusicBrowserList(QFrame):
                     "Sort Title", "Sort Artist", "Sort Album",
                     "Sort Album Artist", "Sort Composer", "Sort Show",
                 ]),
-                ("Video & TV", [
+                ("Video && TV", [
                     "media_type", "Show", "season_number",
                     "episode_number", "Episode", "TV Network",
                     "Description Text", "Subtitle",
@@ -1689,6 +1709,16 @@ class MusicBrowserList(QFrame):
             remove_act = menu.addAction(label)
             if remove_act:
                 remove_act.triggered.connect(self._remove_selected_from_playlist)
+
+        # ── "Remove from iPod" ──
+        menu.addSeparator()
+        n_sel = len(selected)
+        remove_ipod_label = f"Remove {n_sel} Track{'s' if n_sel != 1 else ''} from iPod"
+        remove_ipod_act = menu.addAction(remove_ipod_label)
+        if remove_ipod_act:
+            remove_ipod_act.triggered.connect(
+                lambda _=False, sel=selected: self.remove_from_ipod_requested.emit(sel)
+            )
 
         # ── "Move Up / Move Down" (reorderable playlists only) ──
         if self._is_reorderable_playlist():

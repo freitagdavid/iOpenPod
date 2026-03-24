@@ -142,6 +142,8 @@ class MainWindow(QMainWindow):
 
         self.musicBrowser = MusicBrowser()
         self.musicBrowser.podcastBrowser.podcast_sync_requested.connect(self._onPodcastSyncRequested)
+        self.musicBrowser.browserTrack.remove_from_ipod_requested.connect(self._onRemoveFromIpod)
+        self.musicBrowser.playlistBrowser.trackList.remove_from_ipod_requested.connect(self._onRemoveFromIpod)
 
         self.sidebar = Sidebar()
         self.sidebar.category_changed.connect(self.musicBrowser.updateCategory)
@@ -230,9 +232,17 @@ class MainWindow(QMainWindow):
         self.mainContentStack.setCurrentIndex(0 if has_device else 1)
         self.centralStack.setCurrentIndex(0)
 
-    def _on_theme_changed(self):
-        """Rebuild the entire UI after a live theme switch."""
+    def _rebuild_themed_ui(self, restore_page: int | None = None):
+        """Tear down and rebuild all widgets after a theme/accent change.
+
+        Args:
+            restore_page: Stack index to show after rebuild. ``None`` keeps
+                          the current page index.
+        """
         from GUI.styles import build_palette, app_stylesheet
+
+        if restore_page is None:
+            restore_page = self.centralStack.currentIndex()
 
         app = QApplication.instance()
         if isinstance(app, QApplication):
@@ -249,14 +259,20 @@ class MainWindow(QMainWindow):
         # Rebuild with newly set styles
         self._build_ui()
 
-        # Switch to settings page (where the user just changed the theme)
+        # Restore page and settings state
         self.settingsPage.load_from_settings()
-        self.centralStack.setCurrentIndex(2)
+        self.centralStack.setCurrentIndex(
+            min(restore_page, self.centralStack.count() - 1)
+        )
 
         # If cache is loaded, reload UI from cache
         cache = iTunesDBCache.get_instance()
         if cache.get_tracks():
             self.onDataReady()
+
+    def _on_theme_changed(self):
+        """Rebuild the entire UI after a live theme switch (from settings)."""
+        self._rebuild_themed_ui(restore_page=2)
 
     def selectDevice(self):
         """Open device picker dialog to scan and select an iPod."""
@@ -323,6 +339,12 @@ class MainWindow(QMainWindow):
         from iTunesDB_Shared.constants import get_version_name
         dev = get_current_device()
 
+        # If accent is "match-ipod", apply device color and rebuild UI so
+        # every widget picks up the new accent.
+        if self._apply_match_ipod_accent(dev):
+            self._rebuild_themed_ui(restore_page=0)
+            return  # _rebuild_themed_ui calls onDataReady again via cache check
+
         # Refresh disk usage so the storage bar reflects post-sync changes
         if dev and dev.path:
             try:
@@ -358,6 +380,39 @@ class MainWindow(QMainWindow):
         self.musicBrowser.browserTrack.clearTable(clear_cache=True)
         self._update_podcast_statuses()
         self.musicBrowser.onDataReady()
+
+    def _apply_match_ipod_accent(self, dev=None):
+        """Re-apply accent color when 'match-ipod' is active and device is known.
+
+        Returns True if the accent actually changed (UI rebuild needed).
+        """
+        from settings import get_settings
+        s = get_settings()
+        if s.accent_color != "match-ipod":
+            return False
+        if dev is None:
+            from device_info import get_current_device
+            dev = get_current_device()
+        if not dev:
+            return False
+        # Resolve the image filename for this device
+        from ipod_models import resolve_image_filename, image_for_model
+        img = ""
+        if dev.model_number:
+            img = image_for_model(dev.model_number)
+        if not img and dev.model_family and dev.generation:
+            img = resolve_image_filename(
+                dev.model_family, dev.generation, dev.color or "",
+            )
+        if not img:
+            return False
+        from GUI.styles import resolve_accent_color, Colors
+        accent_hex = resolve_accent_color("match-ipod", img)
+        if accent_hex == "blue":
+            return False  # no color found, keep default
+        old_accent = Colors.ACCENT
+        Colors.apply_theme(s.theme, s.high_contrast, accent_hex)
+        return Colors.ACCENT != old_accent
 
     @staticmethod
     def _classify_tracks(tracks: list) -> dict[str, list]:
@@ -670,6 +725,39 @@ class MainWindow(QMainWindow):
         self.centralStack.setCurrentIndex(1)
         self.syncReview.show_plan(plan)
 
+    def _onRemoveFromIpod(self, tracks: list):
+        """Build a removal-only SyncPlan for the selected tracks and show sync review."""
+        from SyncEngine.fingerprint_diff_engine import SyncAction, SyncItem, SyncPlan, StorageSummary
+
+        if not tracks:
+            return
+
+        to_remove = []
+        bytes_to_remove = 0
+        for t in tracks:
+            db_id = t.get("db_id")
+            title = t.get("Title", "Unknown")
+            artist = t.get("Artist", "")
+            size = t.get("Size", 0)
+            to_remove.append(SyncItem(
+                action=SyncAction.REMOVE_FROM_IPOD,
+                db_id=db_id,
+                ipod_track=t,
+                description=f"Remove: {artist} – {title}" if artist else f"Remove: {title}",
+            ))
+            bytes_to_remove += size
+
+        plan = SyncPlan(
+            to_remove=to_remove,
+            storage=StorageSummary(bytes_to_remove=bytes_to_remove),
+            removals_pre_checked=True,
+        )
+        self._plan = plan
+        cache = iTunesDBCache.get_instance()
+        self.syncReview._ipod_tracks_cache = cache.get_tracks() or []
+        self.centralStack.setCurrentIndex(1)
+        self.syncReview.show_plan(plan)
+
     def _onSyncDiffComplete(self, plan):
         """Called when sync diff calculation is complete."""
         self._plan = plan  # Store for executeSyncPlan to access matched_pc_paths
@@ -790,13 +878,33 @@ class MainWindow(QMainWindow):
         self.syncReview.show_error(error_msg)
 
     def hideSyncReview(self):
-        """Return to the main browsing view, stopping any background scan."""
-        # Request interruption so SyncWorker / SyncExecuteWorker can bail out
+        """Return to the main browsing view, stopping any background work."""
         if self._sync_worker is not None and self._sync_worker.isRunning():
             self._sync_worker.requestInterruption()
-        if self._sync_execute_worker is not None and self._sync_execute_worker.isRunning():
-            self._sync_execute_worker.requestInterruption()
+        self._cleanup_sync_execute_worker()
         self._show_default_page()
+
+    def _cleanup_sync_execute_worker(self):
+        """Request interruption and disconnect all signals from the execute worker.
+
+        The worker thread may continue running briefly (in-flight futures
+        can't be force-killed), but with signals disconnected it can't
+        affect the UI. Clearing the reference lets ``_is_sync_running``
+        return False so a new sync can start cleanly.
+        """
+        w = self._sync_execute_worker
+        if w is None:
+            return
+        if w.isRunning():
+            w.requestInterruption()
+        # Disconnect all signals so stale callbacks don't fire
+        for sig in (w.progress, w.finished, w.error):
+            try:
+                sig.disconnect()
+            except TypeError:
+                pass
+        self._disconnect_skip_signal()
+        self._sync_execute_worker = None
 
     def showSettings(self):
         """Show the settings page."""

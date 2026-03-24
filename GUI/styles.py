@@ -469,7 +469,12 @@ class Colors:
         return False
 
     @classmethod
-    def apply_theme(cls, theme: str = "dark", high_contrast: str = "off") -> None:
+    def apply_theme(
+        cls,
+        theme: str = "dark",
+        high_contrast: str = "off",
+        accent_color: str = "blue",
+    ) -> None:
         """Resolve theme + contrast settings and update all class attributes.
 
         Parameters
@@ -478,6 +483,9 @@ class Colors:
             ``"dark"``, ``"light"``, ``"system"``, or any ``"catppuccin-*"`` key.
         high_contrast : str
             ``"on"``, ``"off"``, or ``"system"`` (ignored for Catppuccin flavors)
+        accent_color : str
+            ``"blue"`` uses the theme default, ``"match-ipod"`` is resolved
+            externally before calling, or a hex string like ``"#e34060"``.
         """
         # Resolve system theme
         if theme == "system":
@@ -504,6 +512,12 @@ class Colors:
         if hc and not is_catppuccin:
             resolved.update(_HC_DARK_OVERRIDES if is_dark else _HC_LIGHT_OVERRIDES)
 
+        # Apply custom accent color (skip for "blue" — use theme default)
+        if accent_color and accent_color not in ("blue", "match-ipod"):
+            rgb = _parse_accent_hex(accent_color)
+            if rgb is not None:
+                resolved.update(_accent_overrides(*rgb, is_dark))
+
         # Apply all palette values to class attributes
         for key, value in resolved.items():
             setattr(cls, key, value)
@@ -514,6 +528,111 @@ class Colors:
         cls.PLAYLIST_PODCAST = pc["PLAYLIST_PODCAST"]
         cls.PLAYLIST_MASTER = pc["PLAYLIST_MASTER"]
         cls.PLAYLIST_REGULAR = pc["PLAYLIST_REGULAR"]
+
+
+# Named accent color presets (settings value → hex).
+ACCENT_PRESETS: dict[str, str] = {
+    "blue": "",           # empty = use theme default
+    "match-ipod": "",     # resolved at runtime from device info
+    "red": "#d94040",
+    "orange": "#d98030",
+    "gold": "#c8a840",
+    "green": "#48a848",
+    "teal": "#38a0a0",
+    "purple": "#8040c8",
+    "pink": "#d05090",
+}
+
+
+def resolve_accent_color(
+    setting: str,
+    ipod_image: str = "",
+) -> str:
+    """Turn an ``accent_color`` setting value into a hex string.
+
+    Returns ``"blue"`` (meaning use theme default) when no override applies.
+    """
+    if setting == "blue":
+        return "blue"
+    if setting == "match-ipod":
+        if ipod_image:
+            from ipod_models import color_for_image
+            rgb = color_for_image(ipod_image)
+            if rgb is not None:
+                return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+        return "blue"  # no iPod connected — fall back to default
+    # Named preset
+    hex_val = ACCENT_PRESETS.get(setting, "")
+    if hex_val:
+        return hex_val
+    # Might be a raw hex from a future custom picker
+    if setting.startswith("#") and len(setting) == 7:
+        return setting
+    return "blue"
+
+
+def _parse_accent_hex(hex_str: str) -> tuple[int, int, int] | None:
+    """Parse a hex color like ``'#e34060'`` into (R, G, B) or None."""
+    s = hex_str.strip().lstrip("#")
+    if len(s) == 6:
+        try:
+            return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+        except ValueError:
+            return None
+    return None
+
+
+def _accent_overrides(r: int, g: int, b: int, is_dark: bool) -> dict[str, str]:
+    """Generate all ACCENT_* palette entries from a single (R, G, B) color.
+
+    Produces the same set of accent keys each palette defines, with
+    alpha levels matching the built-in dark/light palettes.
+    """
+    # Darker shade — shift toward black by ~35%
+    dr, dg, db = int(r * 0.62), int(g * 0.64), int(b * 0.78)
+    # Lighter shade — shift toward white by ~25%
+    lr = min(255, int(r + (255 - r) * 0.25))
+    lg = min(255, int(g + (255 - g) * 0.25))
+    lb = min(255, int(b + (255 - b) * 0.25))
+
+    # Choose text-on-accent based on perceived luminance
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    text_on = "#ffffff" if lum < 160 else "#1a1a2e" if is_dark else "#000000"
+
+    if is_dark:
+        return {
+            "ACCENT": f"#{r:02x}{g:02x}{b:02x}",
+            "ACCENT_LIGHT": f"#{lr:02x}{lg:02x}{lb:02x}",
+            "ACCENT_DIM": f"rgba({r},{g},{b},80)",
+            "ACCENT_HOVER": f"rgba({r},{g},{b},120)",
+            "ACCENT_PRESS": f"rgba({r},{g},{b},60)",
+            "ACCENT_BORDER": f"rgba({r},{g},{b},100)",
+            "ACCENT_MUTED": f"rgba({r},{g},{b},35)",
+            "ACCENT_SOLID": f"rgba({r},{g},{b},200)",
+            "ACCENT_SOLID_PRESS": f"rgba({r},{g},{b},160)",
+            "ACCENT_DARK": f"rgba({dr},{dg},{db},100)",
+            "ACCENT_DARK_DIM": f"rgba({dr},{dg},{db},60)",
+            "BORDER_FOCUS": f"rgba({r},{g},{b},150)",
+            "SELECTION": f"rgba({r},{g},{b},90)",
+            "TEXT_ON_ACCENT": text_on,
+        }
+    else:
+        return {
+            "ACCENT": f"#{r:02x}{g:02x}{b:02x}",
+            "ACCENT_LIGHT": f"#{lr:02x}{lg:02x}{lb:02x}",
+            "ACCENT_DIM": f"rgba({r},{g},{b},60)",
+            "ACCENT_HOVER": f"rgba({r},{g},{b},100)",
+            "ACCENT_PRESS": f"rgba({r},{g},{b},45)",
+            "ACCENT_BORDER": f"rgba({r},{g},{b},80)",
+            "ACCENT_MUTED": f"rgba({r},{g},{b},18)",
+            "ACCENT_SOLID": f"rgba({r},{g},{b},180)",
+            "ACCENT_SOLID_PRESS": f"rgba({r},{g},{b},140)",
+            "ACCENT_DARK": f"rgba({dr},{dg},{db},80)",
+            "ACCENT_DARK_DIM": f"rgba({dr},{dg},{db},40)",
+            "BORDER_FOCUS": f"rgba({r},{g},{b},130)",
+            "SELECTION": f"rgba({r},{g},{b},70)",
+            "TEXT_ON_ACCENT": text_on,
+        }
 
 
 def _parse_color(css: str) -> QColor:

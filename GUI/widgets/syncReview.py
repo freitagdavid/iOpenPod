@@ -12,7 +12,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QRectF
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QProgressBar, QFrame, QStackedWidget, QMessageBox,
-    QFileDialog, QDialog, QCheckBox,
+    QFileDialog, QDialog, QCheckBox, QSizePolicy,
 )
 from PyQt6.QtGui import QFont, QColor, QPainter
 from pathlib import Path
@@ -1059,42 +1059,62 @@ class SyncReviewWidget(QWidget):
         self.stack = QStackedWidget(self)
         layout.addWidget(self.stack, 1)
 
-        # Loading state
+        # Loading / executing state
         loading_widget = QWidget(self.stack)
         loading_layout = QVBoxLayout(loading_widget)
-        loading_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading_layout.setContentsMargins(24, 0, 24, 0)
+        loading_layout.setSpacing(0)
 
+        loading_layout.addStretch(3)
+
+        # Stage headline
         self.loading_label = QLabel("Scanning library...", loading_widget)
-        self.loading_label.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: {Metrics.FONT_TITLE}px;")
+        self.loading_label.setStyleSheet(
+            f"color: {Colors.TEXT_PRIMARY}; font-size: {Metrics.FONT_HERO}px;"
+            f" font-weight: 500;"
+        )
         self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         loading_layout.addWidget(self.loading_label)
 
+        loading_layout.addSpacing(16)
+
+        # Progress bar
         self.progress_bar = QProgressBar(loading_widget)
-        self.progress_bar.setFixedWidth((300))
+        self.progress_bar.setFixedWidth(360)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setStyleSheet(f"""
             QProgressBar {{
                 background: {Colors.BORDER_SUBTLE};
                 border: none;
-                border-radius: {(4)}px;
-                height: {(6)}px;
+                border-radius: 4px;
+                height: 8px;
             }}
             QProgressBar::chunk {{
                 background: {Colors.ACCENT};
-                border-radius: {(3)}px;
+                border-radius: 4px;
             }}
         """)
         loading_layout.addWidget(self.progress_bar, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        self.progress_detail = QLabel("", loading_widget)
-        self.progress_detail.setStyleSheet(f"color: {Colors.TEXT_TERTIARY}; font-size: {Metrics.FONT_LG}px;")
-        self.progress_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        loading_layout.addWidget(self.progress_detail)
+        loading_layout.addSpacing(10)
 
+        # ETA / counter
         self.eta_label = QLabel("", loading_widget)
-        self.eta_label.setStyleSheet(f"color: {Colors.ACCENT}; font-size: {Metrics.FONT_LG}px;")
+        self.eta_label.setStyleSheet(
+            f"color: {Colors.TEXT_TERTIARY}; font-size: {Metrics.FONT_MD}px;"
+        )
         self.eta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         loading_layout.addWidget(self.eta_label)
+
+        loading_layout.addSpacing(16)
+
+        # Detail — current item / worker lines
+        self.progress_detail = QLabel("", loading_widget)
+        self.progress_detail.setStyleSheet(
+            f"color: {Colors.TEXT_TERTIARY}; font-size: {Metrics.FONT_LG}px;"
+        )
+        self.progress_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading_layout.addWidget(self.progress_detail)
 
         # Hint label (shown only during automatic pre-sync backup stage)
         self._backup_hint = QLabel(
@@ -1103,11 +1123,13 @@ class SyncReviewWidget(QWidget):
             loading_widget,
         )
         self._backup_hint.setStyleSheet(
-            f"color: {Colors.TEXT_TERTIARY}; font-size: {Metrics.FONT_MD}px;"
+            f"color: {Colors.TEXT_TERTIARY}; font-size: {Metrics.FONT_SM}px;"
         )
         self._backup_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._backup_hint.setVisible(False)
         loading_layout.addWidget(self._backup_hint)
+
+        loading_layout.addStretch(4)
 
         self.stack.addWidget(loading_widget)  # Index 0
 
@@ -1271,11 +1293,18 @@ class SyncReviewWidget(QWidget):
 
         # Pre-sync backup prompt (Index 4)
         presync_widget = QWidget(self.stack)
-        presync_layout = QVBoxLayout(presync_widget)
-        presync_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        presync_outer = QVBoxLayout(presync_widget)
+        presync_outer.setContentsMargins(0, 0, 0, 0)
+        presync_outer.addStretch()
+
+        # Inner container — all content lives here, centered as one block
+        presync_inner = QWidget(presync_widget)
+        presync_inner.setFixedWidth((460))
+        presync_layout = QVBoxLayout(presync_inner)
+        presync_layout.setContentsMargins(0, 0, 0, 0)
         presync_layout.setSpacing((16))
 
-        self._presync_icon = QLabel("", presync_widget)
+        self._presync_icon = QLabel("", presync_inner)
         _px = glyph_pixmap("download", Metrics.FONT_ICON_XL, Colors.ACCENT)
         if _px:
             self._presync_icon.setPixmap(_px)
@@ -1286,18 +1315,17 @@ class SyncReviewWidget(QWidget):
         self._presync_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         presync_layout.addWidget(self._presync_icon)
 
-        self._presync_title = QLabel("", presync_widget)
+        self._presync_title = QLabel("", presync_inner)
         self._presync_title.setFont(QFont(FONT_FAMILY, Metrics.FONT_PAGE_TITLE, QFont.Weight.Bold))
         self._presync_title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY};")
         self._presync_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         presync_layout.addWidget(self._presync_title)
 
-        self._presync_text = QLabel("", presync_widget)
+        self._presync_text = QLabel("", presync_inner)
         self._presync_text.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: {Metrics.FONT_XL}px;")
         self._presync_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._presync_text.setWordWrap(True)
-        self._presync_text.setMaximumWidth((460))
-        presync_layout.addWidget(self._presync_text, alignment=Qt.AlignmentFlag.AlignCenter)
+        presync_layout.addWidget(self._presync_text)
 
         presync_layout.addSpacing((8))
 
@@ -1306,7 +1334,7 @@ class SyncReviewWidget(QWidget):
         presync_btn_row.addStretch()
 
         # "Skip Backup & Sync Now" / "Sync Without Backup" — secondary action
-        self._presync_skip_btn = QPushButton("Skip Backup & Sync Now", presync_widget)
+        self._presync_skip_btn = QPushButton("Skip Backup && Sync Now", presync_inner)
         self._presync_skip_btn.setStyleSheet(btn_css(
             bg=Colors.SURFACE_RAISED,
             bg_hover=Colors.SURFACE_ACTIVE,
@@ -1320,7 +1348,7 @@ class SyncReviewWidget(QWidget):
         presync_btn_row.addWidget(self._presync_skip_btn)
 
         # "Back Up & Sync" — primary action
-        self._presync_backup_btn = QPushButton("Back Up & Sync", presync_widget)
+        self._presync_backup_btn = QPushButton("Back Up && Sync", presync_inner)
         self._presync_backup_btn.setStyleSheet(f"""
             QPushButton {{
                 background: {Colors.ACCENT};
@@ -1341,12 +1369,15 @@ class SyncReviewWidget(QWidget):
         presync_btn_row.addStretch()
         presync_layout.addLayout(presync_btn_row)
 
-        self._presync_hint = QLabel("", presync_widget)
+        self._presync_hint = QLabel("", presync_inner)
         self._presync_hint.setStyleSheet(
             f"color: {Colors.TEXT_TERTIARY}; font-size: {Metrics.FONT_MD}px;"
         )
         self._presync_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         presync_layout.addWidget(self._presync_hint)
+
+        presync_outer.addWidget(presync_inner, alignment=Qt.AlignmentFlag.AlignHCenter)
+        presync_outer.addStretch()
 
         self.stack.addWidget(presync_widget)  # Index 4
 
@@ -1513,14 +1544,11 @@ class SyncReviewWidget(QWidget):
         self._set_footer_for_state("loading")
 
     def update_progress(self, stage: str, current: int, total: int, message: str):
-        """Update progress indicator."""
+        """Update progress indicator (scan / diff phase)."""
         friendly = self._friendly_stage(stage)
-        if total > 0 and message:
-            self.loading_label.setText(f"{friendly} ({current}/{total})")
-            self.progress_detail.setText(message)
-        else:
-            self.loading_label.setText(friendly)
-            self.progress_detail.setText(message)
+        self.loading_label.setText(friendly)
+        self.progress_detail.setText(message)
+        self.progress_detail.setTextFormat(Qt.TextFormat.PlainText)
 
         if total > 0:
             self.progress_bar.setRange(0, total)
@@ -1685,6 +1713,7 @@ class SyncReviewWidget(QWidget):
 
         # ── Remove from iPod ────────────────────────────────────────
         if plan.to_remove:
+            _rm_checked = plan.removals_pre_checked
             groups = _group_by_media_type(plan.to_remove)
             use_subgroups = len(groups) > 1
 
@@ -1698,7 +1727,7 @@ class SyncReviewWidget(QWidget):
                     card = SyncCategoryCard(
                         "minus", f"Remove {label} from iPod", len(group_items),
                         _CAT_COLORS["remove"], size_bytes=-group_size,
-                        start_checked=False,
+                        start_checked=_rm_checked,
                         subtitle=f"{label} no longer in PC library — will be deleted from iPod",
                         parent=self._cards_container,
                     )
@@ -1710,7 +1739,7 @@ class SyncReviewWidget(QWidget):
             else:
                 card = SyncCategoryCard("minus", "Remove from iPod", len(plan.to_remove),
                                         _CAT_COLORS["remove"], size_bytes=-plan.storage.bytes_to_remove,
-                                        start_checked=False,
+                                        start_checked=_rm_checked,
                                         subtitle="No longer in PC library — will be deleted from iPod",
                                         parent=self._cards_container)
                 for item in plan.to_remove:
@@ -1944,12 +1973,12 @@ class SyncReviewWidget(QWidget):
     def show_executing(self):
         """Show executing state - similar to loading but for sync execution."""
         self._cancelled = False
-        self._completed_stages = []  # Track completed stage names
+        self._completed_stages = []
         self._current_exec_stage = ""
         self._eta_tracker.start()
         self.stack.setCurrentIndex(0)  # Loading view
-        self.loading_label.setText("Starting sync...")
-        self.progress_detail.setText("Preparing...")
+        self.loading_label.setText("Syncing")
+        self.progress_detail.setText("")
         self.progress_bar.setRange(0, 0)  # Indeterminate initially
         self.eta_label.setText("")
         self._backup_hint.setVisible(False)
@@ -1968,7 +1997,7 @@ class SyncReviewWidget(QWidget):
             "Would you like to create a backup before syncing?\n"
             "This protects your iPod data in case anything goes wrong."
         )
-        self._presync_backup_btn.setText("Back Up & Sync")
+        self._presync_backup_btn.setText("Back Up && Sync")
         self._presync_skip_btn.setText("Sync Without Backup")
         self._presync_skip_btn.setVisible(True)
         self._presync_hint.setText("")
@@ -1987,6 +2016,11 @@ class SyncReviewWidget(QWidget):
         self._skip_presync_backup = True
         self.sync_requested.emit(self._pending_sync_items)
 
+    # Stages whose total represents internal sub-steps, not user-meaningful
+    # item counts.  For these we show the progress bar but hide the "X of Y"
+    # counter since "3 of 8" is meaningless to the user.
+    _SUBSTEP_STAGES = frozenset({"write_database", "backup"})
+
     def update_execute_progress(self, prog):
         """Update progress during sync execution.
 
@@ -2001,17 +2035,12 @@ class SyncReviewWidget(QWidget):
         worker_lines = getattr(prog, 'worker_lines', None)
         size_progress = getattr(prog, 'size_progress', None)
 
-        # Transcode is a sub-stage — show its percentage without changing
-        # the headline or stage history.
+        # Transcode is a sub-stage — update the bar without changing
+        # the headline.
         if stage == "transcode":
-            # Show transcode detail under the current stage label
-            detail_parts = []
-            for s in self._completed_stages[-4:]:
-                detail_parts.append(f"<span style='color: {Colors.TEXT_TERTIARY};'>\u2713 {s}</span>")
             if message:
-                detail_parts.append(f"<span style='color: {Colors.TEXT_PRIMARY};'>{message}</span>")
-            self.progress_detail.setText("<br>".join(detail_parts))
-            self.progress_detail.setTextFormat(Qt.TextFormat.RichText)
+                self.progress_detail.setText(message)
+                self.progress_detail.setTextFormat(Qt.TextFormat.PlainText)
             if total > 0:
                 self.progress_bar.setRange(0, total)
                 self.progress_bar.setValue(current)
@@ -2019,7 +2048,7 @@ class SyncReviewWidget(QWidget):
 
         friendly = self._friendly_stage(stage)
 
-        # Track stage transitions for the log
+        # Track stage transitions
         if stage != self._current_exec_stage:
             if self._current_exec_stage:
                 self._completed_stages.append(self._friendly_stage(self._current_exec_stage))
@@ -2029,35 +2058,36 @@ class SyncReviewWidget(QWidget):
         is_backup = (stage == "backup")
         self._backup_hint.setVisible(is_backup and self._is_auto_presync)
         if is_backup:
-            self.cancel_btn.setText("Skip Backup & Sync")
+            self.cancel_btn.setText("Skip Backup && Sync")
             self.cancel_btn.setEnabled(True)
         else:
-            # Leaving backup stage — reset footer cancel to normal
             self.cancel_btn.setText("Cancel")
             self.cancel_btn.setEnabled(True)
 
+        # ── Headline: stage name ──
         self.loading_label.setText(friendly)
 
-        # Build detail text: completed stages + per-worker lines or message
-        detail_parts = []
-        for s in self._completed_stages[-4:]:  # Show last 4 completed stages
-            detail_parts.append(f"<span style='color: {Colors.TEXT_TERTIARY};'>\u2713 {s}</span>")
-
+        # ── Detail: current activity (worker lines or message) ──
         if worker_lines:
-            for line in worker_lines:
-                detail_parts.append(f"<span style='color: {Colors.TEXT_PRIMARY};'>{line}</span>")
+            detail_parts = [
+                f"<span style='color: {Colors.TEXT_SECONDARY};'>{line}</span>"
+                for line in worker_lines
+            ]
+            self.progress_detail.setText("<br>".join(detail_parts))
+            self.progress_detail.setTextFormat(Qt.TextFormat.RichText)
         elif message:
-            detail_parts.append(f"<span style='color: {Colors.TEXT_PRIMARY};'>{message}</span>")
+            self.progress_detail.setText(message)
+            self.progress_detail.setTextFormat(Qt.TextFormat.PlainText)
+        else:
+            self.progress_detail.setText("")
 
-        self.progress_detail.setText("<br>".join(detail_parts))
-        self.progress_detail.setTextFormat(Qt.TextFormat.RichText)
+        # ── Progress bar + ETA ──
+        is_substep = stage in self._SUBSTEP_STAGES
 
-        # Use size-weighted progress for the bar when available
         if size_progress is not None and total > 0:
+            # Size-weighted progress (parallel copy stages)
             self.progress_bar.setRange(0, 10000)
             self.progress_bar.setValue(int(size_progress * 10000))
-            # ETA from elapsed time and overall fraction — stable because
-            # it doesn't depend on per-worker callback timing.
             eta = ""
             if size_progress > 0.01:
                 stats = self._eta_tracker.current_stage_stats
@@ -2075,8 +2105,12 @@ class SyncReviewWidget(QWidget):
         elif total > 0:
             self.progress_bar.setRange(0, total)
             self.progress_bar.setValue(current)
-            self._eta_tracker.update(stage, current, total)
-            self.eta_label.setText(self._eta_tracker.format_stage_progress(stage, current, total))
+            if is_substep:
+                # Sub-step stages: bar moves but don't show "3 of 8"
+                self.eta_label.setText("")
+            else:
+                self._eta_tracker.update(stage, current, total)
+                self.eta_label.setText(self._eta_tracker.format_stage_progress(stage, current, total))
         else:
             self.progress_bar.setRange(0, 0)  # Indeterminate
             self.eta_label.setText("")
