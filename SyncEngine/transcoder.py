@@ -756,16 +756,35 @@ def _run_transcode(
             )
             progress_callback(1.0)
         else:
-            # Audio transcodes: run via Popen so we can kill on cancel
+            # Audio transcodes: run via Popen so we can kill on cancel.
+            # stdout is unused; stderr must be drained in a thread to
+            # prevent a deadlock on Windows where small pipe buffers
+            # (4 KB) fill up and block ffmpeg when multiple workers run
+            # in parallel.
+            import threading as _threading
+
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                 **_SP_KWARGS,
             )
+            stderr_chunks: list[bytes] = []
+
+            def _drain_stderr() -> None:
+                pipe = proc.stderr
+                if pipe is None:
+                    return
+                for chunk in iter(lambda: pipe.read(4096), b""):
+                    stderr_chunks.append(chunk)
+
+            drain_t = _threading.Thread(target=_drain_stderr, daemon=True)
+            drain_t.start()
+
             # Poll so we can check cancellation every 0.5s
             while proc.poll() is None:
                 if is_cancelled and is_cancelled():
                     proc.kill()
                     proc.wait(timeout=5)
+                    drain_t.join(timeout=5)
                     return TranscodeResult(
                         success=False, source_path=source_path,
                         output_path=None, target_format=target,
@@ -775,9 +794,10 @@ def _run_transcode(
                     proc.wait(timeout=0.5)
                 except subprocess.TimeoutExpired:
                     pass
-            _, stderr_raw = proc.communicate(timeout=30)
+
+            drain_t.join(timeout=10)
             returncode = proc.returncode
-            stderr = stderr_raw.decode("utf-8", errors="replace") if isinstance(stderr_raw, bytes) else str(stderr_raw)
+            stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
         if returncode != 0:
             return TranscodeResult(
