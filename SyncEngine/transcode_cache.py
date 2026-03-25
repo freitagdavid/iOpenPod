@@ -44,8 +44,8 @@ logger = logging.getLogger(__name__)
 
 def _resolve_default_cache_dir() -> Path:
     try:
-        from settings import _default_cache_dir
-        return Path(_default_cache_dir())
+        from settings import default_cache_dir
+        return Path(default_cache_dir())
     except Exception:
         return Path.home() / "iOpenPod" / "cache"
 
@@ -534,7 +534,7 @@ class TranscodeCache:
             return False
         try:
             dest_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(cached, dest_path)
+            shutil.copyfile(cached, dest_path)
             logger.debug("Copied from cache: %s → %s", cached.name, dest_path)
             return True
         except Exception as exc:

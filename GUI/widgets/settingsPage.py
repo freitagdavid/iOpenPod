@@ -19,6 +19,7 @@ from ..styles import (
     Colors, FONT_FAMILY, Metrics, btn_css, danger_btn_css,
     sidebar_nav_css, sidebar_nav_selected_css,
     input_css, combo_css, link_btn_css, make_scroll_area,
+    resolve_accent_color,
 )
 
 
@@ -233,6 +234,101 @@ class FolderRow(SettingRow):
     def value(self, v: str):
         self._full_path = v
         self.path_label.setText(self._truncate(v) if v else "Not set")
+
+
+class ResettableFolderRow(SettingRow):
+    """Setting row with folder path, browse button, and X to reset to default."""
+
+    changed = pyqtSignal(str)
+
+    def __init__(self, title: str, description: str = "",
+                 path: str = "", default_label: str = "Platform default"):
+        super().__init__(title, description)
+        self._default_label = default_label
+
+        right_layout = QHBoxLayout()
+        right_layout.setSpacing((8))
+
+        self.path_label = QLabel(self._truncate(path) if path else default_label)
+        self.path_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self.path_label.setStyleSheet(
+            f"color: {Colors.TEXT_SECONDARY}; background: transparent; border: none;"
+        )
+        self.path_label.setMinimumWidth((120))
+        self.path_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        right_layout.addWidget(self.path_label)
+
+        self.browse_btn = QPushButton("Browse\u2026")
+        self.browse_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self.browse_btn.setFixedWidth((80))
+        self.browse_btn.setStyleSheet(btn_css(
+            bg=Colors.SURFACE_RAISED,
+            bg_hover=Colors.SURFACE_ACTIVE,
+            bg_press=Colors.SURFACE_ALT,
+            border=f"1px solid {Colors.BORDER}",
+            padding="4px 8px",
+        ))
+        self.browse_btn.clicked.connect(self._browse)
+        right_layout.addWidget(self.browse_btn)
+
+        self.clear_btn = QPushButton("\u2715")
+        self.clear_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self.clear_btn.setFixedWidth((28))
+        self.clear_btn.setToolTip("Reset to default")
+        self.clear_btn.setStyleSheet(btn_css(
+            bg="transparent",
+            bg_hover=Colors.SURFACE_ACTIVE,
+            bg_press=Colors.SURFACE_ALT,
+            fg=Colors.TEXT_TERTIARY,
+            border="none",
+            padding="2px",
+        ))
+        self.clear_btn.clicked.connect(self._clear)
+        right_layout.addWidget(self.clear_btn)
+
+        container = QWidget()
+        container.setLayout(right_layout)
+        self.add_control(container)
+
+        self._full_path = path
+        self._update_clear_visibility()
+
+    def _truncate(self, path: str) -> str:
+        if len(path) > 40:
+            return "\u2026" + path[-38:]
+        return path
+
+    def _update_clear_visibility(self):
+        self.clear_btn.setVisible(bool(self._full_path))
+
+    def _browse(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Folder", self._full_path,
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if folder:
+            self._full_path = folder
+            self.path_label.setText(self._truncate(folder))
+            self._update_clear_visibility()
+            self.changed.emit(folder)
+
+    def _clear(self):
+        self._full_path = ""
+        self.path_label.setText(self._default_label)
+        self._update_clear_visibility()
+        self.changed.emit("")
+
+    @property
+    def value(self) -> str:
+        return self._full_path
+
+    @value.setter
+    def value(self, v: str):
+        self._full_path = v
+        self.path_label.setText(self._truncate(v) if v else self._default_label)
+        self._update_clear_visibility()
 
 
 class ActionRow(SettingRow):
@@ -835,13 +931,32 @@ class SettingsPage(QWidget):
             current="Off",
         )
 
+        self.font_scale = ComboRow(
+            "Font Size",
+            "Scale text size across the interface for accessibility.",
+            options=["75%", "90%", "100%", "110%", "125%", "150%"],
+            current="100%",
+        )
+
+        self.accent_color = ComboRow(
+            "Accent Color",
+            "Customize the accent color used throughout the interface. "
+            "Match iPod uses the body color of your connected iPod.",
+            options=[
+                "Blue (Default)", "Match iPod",
+                "Red", "Orange", "Gold", "Green",
+                "Teal", "Purple", "Pink",
+            ],
+            current="Blue (Default)",
+        )
+
         self.show_art = ToggleRow(
             "Track List Artwork",
             "Show album art thumbnails next to tracks in the list view.",
             checked=True,
         )
 
-        from ..settings import get_version
+        from settings import get_version
         self.version_row = ActionRow(
             f"iOpenPod v{get_version()}",
             "Check for a newer version of iOpenPod.",
@@ -863,7 +978,7 @@ class SettingsPage(QWidget):
         return self._make_page(
             "General",
             "Appearance",
-            _SettingsCard(self.theme_combo, self.high_contrast, self.show_art),
+            _SettingsCard(self.theme_combo, self.high_contrast, self.accent_color, self.font_scale, self.show_art),
             "About",
             _SettingsCard(self.version_row, self.bug_report_row),
         )
@@ -973,18 +1088,21 @@ class SettingsPage(QWidget):
 
         return self._make_page(
             "Transcoding",
+            "Audio",
             _SettingsCard(
                 self.aac_quality,
                 self.prefer_lossy,
                 self.mono_for_spoken,
                 self.smart_quality_by_type,
+                self.normalize_sample_rate,
             ),
+            "Video",
             _SettingsCard(
                 self.video_crf,
                 self.video_preset,
             ),
+            "Performance",
             _SettingsCard(
-                self.normalize_sample_rate,
                 self.sync_workers,
             ),
         )
@@ -1049,10 +1167,11 @@ class SettingsPage(QWidget):
         )
 
     def _build_storage_page(self) -> QScrollArea:
-        self.transcode_cache_dir = FolderRow(
-            "Transcode Cache",
+        self.transcode_cache_dir = ResettableFolderRow(
+            "Cache Location",
             "Where transcoded files are cached to avoid re-encoding "
-            "on future syncs. Leave empty for the platform default.",
+            "on future syncs.",
+            default_label="Platform default",
         )
         self.max_cache_size = ComboRow(
             "Max Cache Size",
@@ -1062,35 +1181,31 @@ class SettingsPage(QWidget):
             current="5 GB",
         )
         self.cache_status = _CacheSizeRow()
-        self.settings_dir = FolderRow(
+        self.settings_dir = ResettableFolderRow(
             "Settings Location",
             "Custom directory to store iOpenPod settings. Useful for "
-            "portable setups or backups. Leave empty for the platform default.",
+            "portable setups or backups.",
+            default_label="Platform default",
         )
-        self.log_dir = FolderRow(
+        self.log_dir = ResettableFolderRow(
             "Log Location",
             "Where iOpenPod writes log files and crash reports. "
-            "Leave empty for the platform default. "
             "Takes effect on next launch.",
+            default_label="Platform default",
         )
-        self.reset_storage_row = ActionRow(
-            "Reset to Default",
-            "Clear all custom storage paths and use platform defaults.",
-            button_text="Reset",
-        )
-        self.reset_storage_row.clicked.connect(self._reset_storage_defaults)
 
         return self._make_page(
             "Storage",
+            "Transcode Cache",
             _SettingsCard(
                 self.transcode_cache_dir,
                 self.max_cache_size,
                 self.cache_status,
             ),
+            "Locations",
             _SettingsCard(
                 self.settings_dir,
                 self.log_dir,
-                self.reset_storage_row,
             ),
         )
 
@@ -1129,7 +1244,7 @@ class SettingsPage(QWidget):
 
     def load_from_settings(self):
         """Populate UI controls from the current AppSettings."""
-        from ..settings import get_settings
+        from settings import get_settings
         s = get_settings()
 
         self.music_folder.value = s.music_folder
@@ -1174,6 +1289,23 @@ class SettingsPage(QWidget):
         idx = self.high_contrast.combo.findText(hc_text)
         if idx >= 0:
             self.high_contrast.combo.setCurrentIndex(idx)
+
+        # Accent color
+        accent_display = {
+            "blue": "Blue (Default)", "match-ipod": "Match iPod",
+            "red": "Red", "orange": "Orange", "gold": "Gold",
+            "green": "Green", "teal": "Teal", "purple": "Purple",
+            "pink": "Pink",
+        }
+        ac_text = accent_display.get(s.accent_color, "Blue (Default)")
+        idx = self.accent_color.combo.findText(ac_text)
+        if idx >= 0:
+            self.accent_color.combo.setCurrentIndex(idx)
+
+        # Font scale
+        idx = self.font_scale.combo.findText(s.font_scale)
+        if idx >= 0:
+            self.font_scale.combo.setCurrentIndex(idx)
 
         self.transcode_cache_dir.value = s.transcode_cache_dir
         # Max cache size combo
@@ -1255,8 +1387,10 @@ class SettingsPage(QWidget):
             self.video_preset.changed.connect(self._save)
             self.sync_workers.changed.connect(self._save)
             self.show_art.changed.connect(self._save)
+            self.accent_color.changed.connect(self._save)
             self.theme_combo.changed.connect(self._save)
             self.high_contrast.changed.connect(self._save)
+            self.font_scale.changed.connect(self._save)
             self.transcode_cache_dir.changed.connect(self._save)
             self.max_cache_size.changed.connect(self._save)
             self.settings_dir.changed.connect(self._save)
@@ -1270,7 +1404,7 @@ class SettingsPage(QWidget):
 
     def _save(self, *_args):
         """Read all controls back into AppSettings and persist."""
-        from ..settings import get_settings
+        from settings import get_settings
         s = get_settings()
 
         s.music_folder = self.music_folder.value
@@ -1296,12 +1430,21 @@ class SettingsPage(QWidget):
             "Catppuccin Frappé": "catppuccin-frappe",
             "Catppuccin Latte": "catppuccin-latte",
         }
-        old_theme, old_hc = s.theme, s.high_contrast
+        old_theme, old_hc, old_accent = s.theme, s.high_contrast, s.accent_color
         s.theme = theme_keys.get(self.theme_combo.value, "dark")
 
         # High contrast
         hc_keys = {"Off": "off", "On": "on", "System": "system"}
         s.high_contrast = hc_keys.get(self.high_contrast.value, "off")
+
+        # Accent color
+        accent_keys = {
+            "Blue (Default)": "blue", "Match iPod": "match-ipod",
+            "Red": "red", "Orange": "orange", "Gold": "gold",
+            "Green": "green", "Teal": "teal", "Purple": "purple",
+            "Pink": "pink",
+        }
+        s.accent_color = accent_keys.get(self.accent_color.value, "blue")
 
         s.transcode_cache_dir = self.transcode_cache_dir.value
         # Parse max cache size
@@ -1362,25 +1505,52 @@ class SettingsPage(QWidget):
         sw_text = self.sync_workers.value
         s.sync_workers = int(sw_text) if sw_text and sw_text != "Auto" else 0
 
+        # Font scale
+        scale_keys = {
+            "75%": "75%", "90%": "90%", "100%": "100%",
+            "110%": "110%", "125%": "125%", "150%": "150%",
+        }
+        old_scale = s.font_scale
+        s.font_scale = scale_keys.get(self.font_scale.value, "100%")
+
         s.save()
 
-        # If theme or contrast changed, apply immediately and notify
-        if s.theme != old_theme or s.high_contrast != old_hc:
-            Colors.apply_theme(s.theme, s.high_contrast)
+        # If theme, contrast, accent, or font scale changed, apply immediately
+        if (s.theme != old_theme or s.high_contrast != old_hc
+                or s.font_scale != old_scale or s.accent_color != old_accent):
+            accent_hex = resolve_accent_color(
+                s.accent_color, self._current_ipod_image(),
+            )
+            Colors.apply_theme(s.theme, s.high_contrast, accent_hex)
+            Metrics.apply_font_scale(s.font_scale)
             self.theme_changed.emit()
+
+    @staticmethod
+    def _current_ipod_image() -> str:
+        """Return the image filename for the currently connected iPod, or ''."""
+        try:
+            from device_info import get_current_device
+            dev = get_current_device()
+            if not dev:
+                return ""
+            from ipod_models import image_for_model, resolve_image_filename
+            if dev.model_number:
+                img = image_for_model(dev.model_number)
+                if img:
+                    return img
+            if dev.model_family and dev.generation:
+                return resolve_image_filename(
+                    dev.model_family, dev.generation, dev.color or "",
+                )
+        except Exception:
+            pass
+        return ""
 
     # ── Event handlers ──────────────────────────────────────────────────────
 
     def _on_close(self):
         """Go back — settings are already saved on every change."""
         self.closed.emit()
-
-    def _reset_storage_defaults(self):
-        """Clear custom storage paths and revert to platform defaults."""
-        self.transcode_cache_dir.value = ""
-        self.settings_dir.value = ""
-        self.log_dir.value = ""
-        self._save()
 
     def _check_for_updates(self):
         """Check GitHub for a newer version in a background thread."""
@@ -1613,7 +1783,7 @@ class SettingsPage(QWidget):
 
     def _on_listenbrainz_token_changed(self, token: str):
         """Handle ListenBrainz token save/clear."""
-        from ..settings import get_settings
+        from settings import get_settings
         s = get_settings()
 
         if not token:
@@ -1653,7 +1823,7 @@ class SettingsPage(QWidget):
             self.listenbrainz_token_row.set_error("Invalid token")
             return
 
-        from ..settings import get_settings
+        from settings import get_settings
         s = get_settings()
         s.listenbrainz_token = token
         s.listenbrainz_username = username

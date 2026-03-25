@@ -4,6 +4,9 @@ import logging
 import logging.handlers
 import traceback
 
+# Prevent macOS from creating ._AppleDouble resource fork files on FAT32 iPods
+os.environ.setdefault("COPYFILE_DISABLE", "1")
+
 
 def _get_log_dir() -> str:
     """Get log directory, defaulting to platform-appropriate location."""
@@ -17,8 +20,8 @@ def _get_log_dir() -> str:
     except Exception:
         pass
 
-    from settings import _default_data_dir
-    log_dir = os.path.join(_default_data_dir(), "logs")
+    from settings import default_data_dir
+    log_dir = os.path.join(default_data_dir(), "logs")
     os.makedirs(log_dir, exist_ok=True)
     return log_dir
 
@@ -145,7 +148,7 @@ sys.excepthook = global_exception_handler
 
 
 def run_pyqt_app():
-    from GUI.settings import get_version
+    from settings import get_version
     logger.info("iOpenPod v%s starting — log file: %s", get_version(), _log_file_path)
 
     # On Linux, PyInstaller-bundled Qt platforminputcontexts plugins
@@ -172,14 +175,16 @@ def run_pyqt_app():
 
     # Use custom proxy style for dark scrollbars (CSS scrollbar styling is
     # unreliable on Windows with Fusion — this paints them directly).
-    from GUI.styles import Colors, DarkScrollbarStyle, build_palette
+    from GUI.styles import Colors, DarkScrollbarStyle, Metrics, build_palette
     app.setStyle(DarkScrollbarStyle("Fusion"))
 
     # Apply the selected color theme (reads settings; must come after
     # QApplication exists so system-theme detection works).
     from settings import get_settings
     _s = get_settings()
-    Colors.apply_theme(_s.theme, _s.high_contrast)
+    from GUI.styles import resolve_accent_color
+    Colors.apply_theme(_s.theme, _s.high_contrast, resolve_accent_color(_s.accent_color))
+    Metrics.apply_font_scale(_s.font_scale)
 
     # Build a palette from the active Colors and apply it.
     app.setPalette(build_palette())

@@ -11,11 +11,11 @@ from PyQt6.QtWidgets import (
 )
 from GUI.widgets.musicBrowser import MusicBrowser
 from GUI.widgets.sidebar import Sidebar
-from GUI.widgets.syncReview import SyncReviewWidget, SyncWorker, PCFolderDialog, SyncExecuteWorker
+from GUI.widgets.syncReview import SyncReviewWidget, SyncWorker, PCFolderDialog, SyncExecuteWorker, QuickPlaylistSyncWorker
 from GUI.widgets.settingsPage import SettingsPage
 from GUI.widgets.backupBrowser import BackupBrowserWidget
 from GUI.widgets.dropOverlay import DropOverlayWidget
-from GUI.settings import get_settings
+from settings import get_settings
 from GUI.notifications import Notifier
 from GUI.styles import Colors, FONT_FAMILY, Metrics, btn_css
 from GUI.glyphs import glyph_pixmap
@@ -56,6 +56,13 @@ class MainWindow(QMainWindow):
         self._quick_meta_timer.setInterval(1500)  # 1.5 s debounce
         self._quick_meta_timer.timeout.connect(self._start_quick_meta_write)
 
+        # Quick playlist sync (add/remove/reorder tracks in playlist)
+        self._quick_pl_worker: QuickPlaylistSyncWorker | None = None
+        self._quick_pl_timer = QTimer(self)
+        self._quick_pl_timer.setSingleShot(True)
+        self._quick_pl_timer.setInterval(1500)  # 1.5 s debounce
+        self._quick_pl_timer.timeout.connect(self._start_quick_playlist_sync)
+
         # Central widget with stacked layout for main/sync views
         self.centralStack = QStackedWidget()
         self.setCentralWidget(self.centralStack)
@@ -74,6 +81,9 @@ class MainWindow(QMainWindow):
 
         # Schedule an immediate write whenever track flags are edited in the UI
         iTunesDBCache.get_instance().tracks_changed.connect(self._schedule_quick_meta_write)
+
+        # Instant playlist sync whenever playlists are added/edited via context menu
+        iTunesDBCache.get_instance().playlist_quick_sync.connect(self._quick_sync_playlists)
 
         # Restore last device path if it still looks like a real iPod
         if settings.last_device_path:
@@ -132,6 +142,8 @@ class MainWindow(QMainWindow):
 
         self.musicBrowser = MusicBrowser()
         self.musicBrowser.podcastBrowser.podcast_sync_requested.connect(self._onPodcastSyncRequested)
+        self.musicBrowser.browserTrack.remove_from_ipod_requested.connect(self._onRemoveFromIpod)
+        self.musicBrowser.playlistBrowser.trackList.remove_from_ipod_requested.connect(self._onRemoveFromIpod)
 
         self.sidebar = Sidebar()
         self.sidebar.category_changed.connect(self.musicBrowser.updateCategory)
@@ -220,9 +232,17 @@ class MainWindow(QMainWindow):
         self.mainContentStack.setCurrentIndex(0 if has_device else 1)
         self.centralStack.setCurrentIndex(0)
 
-    def _on_theme_changed(self):
-        """Rebuild the entire UI after a live theme switch."""
+    def _rebuild_themed_ui(self, restore_page: int | None = None):
+        """Tear down and rebuild all widgets after a theme/accent change.
+
+        Args:
+            restore_page: Stack index to show after rebuild. ``None`` keeps
+                          the current page index.
+        """
         from GUI.styles import build_palette, app_stylesheet
+
+        if restore_page is None:
+            restore_page = self.centralStack.currentIndex()
 
         app = QApplication.instance()
         if isinstance(app, QApplication):
@@ -239,14 +259,20 @@ class MainWindow(QMainWindow):
         # Rebuild with newly set styles
         self._build_ui()
 
-        # Switch to settings page (where the user just changed the theme)
+        # Restore page and settings state
         self.settingsPage.load_from_settings()
-        self.centralStack.setCurrentIndex(2)
+        self.centralStack.setCurrentIndex(
+            min(restore_page, self.centralStack.count() - 1)
+        )
 
         # If cache is loaded, reload UI from cache
         cache = iTunesDBCache.get_instance()
         if cache.get_tracks():
             self.onDataReady()
+
+    def _on_theme_changed(self):
+        """Rebuild the entire UI after a live theme switch (from settings)."""
+        self._rebuild_themed_ui(restore_page=2)
 
     def selectDevice(self):
         """Open device picker dialog to scan and select an iPod."""
@@ -313,6 +339,22 @@ class MainWindow(QMainWindow):
         from iTunesDB_Shared.constants import get_version_name
         dev = get_current_device()
 
+        # If accent is "match-ipod", apply device color and rebuild UI so
+        # every widget picks up the new accent.
+        if self._apply_match_ipod_accent(dev):
+            self._rebuild_themed_ui(restore_page=0)
+            return  # _rebuild_themed_ui calls onDataReady again via cache check
+
+        # Refresh disk usage so the storage bar reflects post-sync changes
+        if dev and dev.path:
+            try:
+                import shutil as _shutil
+                _total, _used, _free = _shutil.disk_usage(dev.path)
+                dev.disk_size_gb = round(_total / 1e9, 1)
+                dev.free_space_gb = round(_free / 1e9, 1)
+            except OSError:
+                pass
+
         device_name = dev.ipod_name if dev else "Unk iPod"
         model = dev.display_name if dev else "Unk iPod"
 
@@ -338,6 +380,39 @@ class MainWindow(QMainWindow):
         self.musicBrowser.browserTrack.clearTable(clear_cache=True)
         self._update_podcast_statuses()
         self.musicBrowser.onDataReady()
+
+    def _apply_match_ipod_accent(self, dev=None):
+        """Re-apply accent color when 'match-ipod' is active and device is known.
+
+        Returns True if the accent actually changed (UI rebuild needed).
+        """
+        from settings import get_settings
+        s = get_settings()
+        if s.accent_color != "match-ipod":
+            return False
+        if dev is None:
+            from device_info import get_current_device
+            dev = get_current_device()
+        if not dev:
+            return False
+        # Resolve the image filename for this device
+        from ipod_models import resolve_image_filename, image_for_model
+        img = ""
+        if dev.model_number:
+            img = image_for_model(dev.model_number)
+        if not img and dev.model_family and dev.generation:
+            img = resolve_image_filename(
+                dev.model_family, dev.generation, dev.color or "",
+            )
+        if not img:
+            return False
+        from GUI.styles import resolve_accent_color, Colors
+        accent_hex = resolve_accent_color("match-ipod", img)
+        if accent_hex == "blue":
+            return False  # no color found, keep default
+        old_accent = Colors.ACCENT
+        Colors.apply_theme(s.theme, s.high_contrast, accent_hex)
+        return Colors.ACCENT != old_accent
 
     @staticmethod
     def _classify_tracks(tracks: list) -> dict[str, list]:
@@ -650,6 +725,39 @@ class MainWindow(QMainWindow):
         self.centralStack.setCurrentIndex(1)
         self.syncReview.show_plan(plan)
 
+    def _onRemoveFromIpod(self, tracks: list):
+        """Build a removal-only SyncPlan for the selected tracks and show sync review."""
+        from SyncEngine.fingerprint_diff_engine import SyncAction, SyncItem, SyncPlan, StorageSummary
+
+        if not tracks:
+            return
+
+        to_remove = []
+        bytes_to_remove = 0
+        for t in tracks:
+            db_id = t.get("db_id")
+            title = t.get("Title", "Unknown")
+            artist = t.get("Artist", "")
+            size = t.get("Size", 0)
+            to_remove.append(SyncItem(
+                action=SyncAction.REMOVE_FROM_IPOD,
+                db_id=db_id,
+                ipod_track=t,
+                description=f"Remove: {artist} – {title}" if artist else f"Remove: {title}",
+            ))
+            bytes_to_remove += size
+
+        plan = SyncPlan(
+            to_remove=to_remove,
+            storage=StorageSummary(bytes_to_remove=bytes_to_remove),
+            removals_pre_checked=True,
+        )
+        self._plan = plan
+        cache = iTunesDBCache.get_instance()
+        self.syncReview._ipod_tracks_cache = cache.get_tracks() or []
+        self.centralStack.setCurrentIndex(1)
+        self.syncReview.show_plan(plan)
+
     def _onSyncDiffComplete(self, plan):
         """Called when sync diff calculation is complete."""
         self._plan = plan  # Store for executeSyncPlan to access matched_pc_paths
@@ -770,13 +878,33 @@ class MainWindow(QMainWindow):
         self.syncReview.show_error(error_msg)
 
     def hideSyncReview(self):
-        """Return to the main browsing view, stopping any background scan."""
-        # Request interruption so SyncWorker / SyncExecuteWorker can bail out
+        """Return to the main browsing view, stopping any background work."""
         if self._sync_worker is not None and self._sync_worker.isRunning():
             self._sync_worker.requestInterruption()
-        if self._sync_execute_worker is not None and self._sync_execute_worker.isRunning():
-            self._sync_execute_worker.requestInterruption()
+        self._cleanup_sync_execute_worker()
         self._show_default_page()
+
+    def _cleanup_sync_execute_worker(self):
+        """Request interruption and disconnect all signals from the execute worker.
+
+        The worker thread may continue running briefly (in-flight futures
+        can't be force-killed), but with signals disconnected it can't
+        affect the UI. Clearing the reference lets ``_is_sync_running``
+        return False so a new sync can start cleanly.
+        """
+        w = self._sync_execute_worker
+        if w is None:
+            return
+        if w.isRunning():
+            w.requestInterruption()
+        # Disconnect all signals so stale callbacks don't fire
+        for sig in (w.progress, w.finished, w.error):
+            try:
+                sig.disconnect()
+            except TypeError:
+                pass
+        self._disconnect_skip_signal()
+        self._sync_execute_worker = None
 
     def showSettings(self):
         """Show the settings page."""
@@ -934,6 +1062,79 @@ class MainWindow(QMainWindow):
 
         cache.start_loading()
 
+    # ── Quick Playlist Sync ────────────────────────────────────────────────
+
+    def _quick_sync_playlists(self) -> None:
+        """Debounce-schedule a quick playlist sync after playlist edits."""
+        if self._is_sync_running():
+            return
+        device_manager = DeviceManager.get_instance()
+        if not device_manager.device_path:
+            return
+        self._quick_pl_timer.start()  # resets if already running
+
+    def _start_quick_playlist_sync(self) -> None:
+        """Launch the quick playlist sync worker (called by debounce timer)."""
+        if self._is_sync_running():
+            return
+
+        cache = iTunesDBCache.get_instance()
+        if not cache.has_pending_playlists():
+            return
+
+        device_manager = DeviceManager.get_instance()
+        ipod_path = device_manager.device_path
+        if not ipod_path:
+            return
+
+        # Prevent overlapping quick syncs (with itself or quick meta write)
+        if self._quick_pl_worker is not None and self._quick_pl_worker.isRunning():
+            self._quick_pl_timer.start()  # retry after debounce
+            return
+        if self._quick_meta_worker is not None and self._quick_meta_worker.isRunning():
+            self._quick_pl_timer.start()  # retry after debounce
+            return
+
+        user_playlists = cache.get_user_playlists()
+
+        def _on_complete():
+            c = iTunesDBCache.get_instance()
+            if c.has_pending_playlists():
+                c._user_playlists.clear()
+
+        self.sidebar.show_save_indicator("saving")
+
+        self._quick_pl_worker = QuickPlaylistSyncWorker(
+            ipod_path=ipod_path,
+            user_playlists=user_playlists,
+            on_complete=_on_complete,
+        )
+        self._quick_pl_worker.completed.connect(self._on_quick_playlist_sync_done)
+        self._quick_pl_worker.error.connect(self._on_quick_playlist_sync_error)
+        self._quick_pl_worker.start()
+
+    def _on_quick_playlist_sync_done(self, result) -> None:
+        """Called when quick playlist sync finishes."""
+        # Wait for thread to fully exit before dropping the reference
+        if self._quick_pl_worker is not None:
+            self._quick_pl_worker.wait()
+            self._quick_pl_worker = None
+        if result.success:
+            logger.info("Quick playlist sync completed successfully")
+            self.sidebar.show_save_indicator("saved")
+        else:
+            errors = "; ".join(msg for _, msg in result.errors)
+            logger.error("Quick playlist sync failed: %s", errors)
+            self.sidebar.show_save_indicator("error")
+
+    def _on_quick_playlist_sync_error(self, error_msg: str) -> None:
+        """Called when quick playlist sync raises an exception."""
+        if self._quick_pl_worker is not None:
+            self._quick_pl_worker.wait()
+            self._quick_pl_worker = None
+        logger.error("Quick playlist sync error: %s", error_msg)
+        self.sidebar.show_save_indicator("error")
+
     def _disconnect_skip_signal(self):
         """Disconnect skip_backup_signal from the finished worker."""
         try:
@@ -948,7 +1149,7 @@ class MainWindow(QMainWindow):
         if not self.isActiveWindow():
             self._notifier.notify_sync_error(error_msg)
 
-        from .settings import get_settings
+        from settings import get_settings
         settings = get_settings()
 
         msg = f"Sync failed:\n\n{error_msg}"
@@ -1066,7 +1267,7 @@ class MainWindow(QMainWindow):
         """Ensure all threads are stopped when the window is closed."""
         # Persist window dimensions
         try:
-            from GUI.settings import get_settings as _get_settings
+            from settings import get_settings as _get_settings
             _s = _get_settings()
             _s.window_width = self.width()
             _s.window_height = self.height()
@@ -1499,6 +1700,7 @@ class iTunesDBCache(QObject):
     _instance: "iTunesDBCache | None" = None
 
     playlists_changed = pyqtSignal()   # Emitted when user playlists are added/edited/removed
+    playlist_quick_sync = pyqtSignal()  # Emitted when playlists should be written to iPod immediately
     tracks_changed = pyqtSignal()       # Emitted when track flags are modified (pending sync)
 
     def __init__(self):

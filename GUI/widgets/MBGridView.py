@@ -8,7 +8,7 @@ from ..styles import Metrics
 log = logging.getLogger(__name__)
 
 
-# ── Flow layout ──────────────────────────────────────────────────────────────
+# -- Flow layout ──────────────────────────────────────────────────────────────
 # Lays out fixed-size children left-to-right, wrapping to the next row.
 # Items are always left-aligned; no centering hack needed.
 
@@ -95,6 +95,9 @@ class _FlowLayout(QLayout):
         return y + row_height + m.bottom()
 
 
+_ART_BATCH_SIZE = 20  # mhiiLinks per background worker
+
+
 class MusicBrowserGrid(QFrame):
     """Grid view that displays albums, artists, or genres as clickable items."""
     item_selected = pyqtSignal(dict)  # Emits when an item is clicked
@@ -115,6 +118,10 @@ class MusicBrowserGrid(QFrame):
         self.columnCount = 1  # kept for external compat, not used by layout
         self._current_category = "Albums"
         self._load_id = 0
+
+        # Artwork loading state
+        self._items_by_link: dict[int, list[MusicBrowserGridItem]] = {}  # mhiiLink -> items waiting for art
+        self._art_pending: set[int] = set()  # links currently being loaded
 
     def loadCategory(self, category: str):
         """Load and display items for the specified category."""
@@ -159,6 +166,8 @@ class MusicBrowserGrid(QFrame):
 
         if not self.pendingItems:
             self.timerActive = False
+            # All items added — kick off batched artwork loading
+            self._load_art_async()
             return
 
         batch_size = 5
@@ -187,6 +196,11 @@ class MusicBrowserGrid(QFrame):
                 gridItem = MusicBrowserGridItem(title, subtitle, mhiiLink, item_data)
                 gridItem.clicked.connect(self._onItemClicked)
                 self.gridItems.append(gridItem)
+
+                # Track which items need artwork
+                if mhiiLink is not None:
+                    self._items_by_link.setdefault(int(mhiiLink), []).append(gridItem)
+
             elif isinstance(item, MusicBrowserGridItem):
                 gridItem = item
                 gridItem.clicked.connect(self._onItemClicked)
@@ -196,8 +210,6 @@ class MusicBrowserGrid(QFrame):
             self._flow.addWidget(gridItem)
 
         # Update minimum height so the scroll area can size correctly.
-        # Without this, items added while the viewport is hidden or 0-width
-        # can all end up at (0, 0).
         w = self.width()
         if w > 0:
             self.setMinimumHeight(self._flow.heightForWidth(w))
@@ -206,6 +218,99 @@ class MusicBrowserGrid(QFrame):
             QTimer.singleShot(8, lambda: self._addNextItem(load_id))
         else:
             self.timerActive = False
+            # All items added — kick off batched artwork loading
+            self._load_art_async()
+
+    # -------------------------------------------------------------------------
+    # Batched artwork loading
+    # -------------------------------------------------------------------------
+
+    def _load_art_async(self):
+        """Collect unique mhiiLinks and load artwork in background batches."""
+        from ..app import Worker, ThreadPoolSingleton
+
+        links_to_load = set(self._items_by_link.keys()) - self._art_pending
+        if not links_to_load:
+            return
+
+        self._art_pending |= links_to_load
+        load_id = self._load_id
+        links_list = list(links_to_load)
+        pool = ThreadPoolSingleton.get_instance()
+
+        for i in range(0, len(links_list), _ART_BATCH_SIZE):
+            chunk = links_list[i:i + _ART_BATCH_SIZE]
+            worker = Worker(self._load_art_batch, chunk)
+            worker.signals.result.connect(
+                lambda result, lid=load_id: self._on_art_loaded(result, lid)
+            )
+            pool.start(worker)
+
+    @staticmethod
+    def _load_art_batch(links: list[int]) -> dict:
+        """Background worker: decode artwork + colors for a batch of mhiiLinks."""
+        from ..app import DeviceManager
+        from ..imgMaker import find_image_by_img_id, get_artworkdb_cached
+        import os
+
+        device = DeviceManager.get_instance()
+        if not device.device_path:
+            return {}
+
+        artworkdb_path = device.artworkdb_path
+        artwork_folder = device.artwork_folder_path
+        if not artworkdb_path or not os.path.exists(artworkdb_path):
+            return {}
+
+        artworkdb_data, img_id_index = get_artworkdb_cached(artworkdb_path)
+        results: dict[int, tuple | None] = {}
+
+        for link in links:
+            if device.cancellation_token.is_cancelled():
+                break
+            result = find_image_by_img_id(artworkdb_data, artwork_folder, link, img_id_index)
+            if result is not None:
+                pil_img, dcol, album_colors = result
+                # Serialize PIL image to RGBA bytes for thread-safe transfer
+                pil_img = pil_img.convert("RGBA")
+                results[link] = (pil_img.width, pil_img.height,
+                                 pil_img.tobytes("raw", "RGBA"),
+                                 dcol, album_colors)
+            else:
+                results[link] = None
+
+        return results
+
+    def _on_art_loaded(self, results: dict | None, load_id: int):
+        """Main-thread callback: apply loaded artwork to grid items."""
+        if results is None or self._load_id != load_id:
+            return
+
+        from PIL import Image
+
+        try:
+            for link, data in results.items():
+                self._art_pending.discard(link)
+                items = self._items_by_link.get(link, [])
+                if not items:
+                    continue
+
+                if data is None:
+                    for item in items:
+                        item.applyImageResult(None, None, None)
+                    continue
+
+                w, h, rgba, dcol, album_colors = data
+                pil_img = Image.frombytes("RGBA", (w, h), rgba)
+
+                for item in items:
+                    item.applyImageResult(pil_img, dcol, album_colors)
+
+                # Remove from tracking — these items are done
+                self._items_by_link.pop(link, None)
+
+        except RuntimeError:
+            pass  # Widget deleted
 
     def _onItemClicked(self, item_data: dict):
         """Handle grid item click."""
@@ -220,6 +325,8 @@ class MusicBrowserGrid(QFrame):
         self.timerActive = False
         self.pendingItems = deque()
         self._load_id += 1
+        self._items_by_link.clear()
+        self._art_pending.clear()
 
         while self._flow.count():
             item = self._flow.takeAt(0)

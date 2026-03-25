@@ -1,6 +1,7 @@
 import logging
 import os
 import threading
+from collections import OrderedDict
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
 
@@ -12,6 +13,37 @@ _artworkdb_cache = None
 _artworkdb_path_cache = None
 _img_id_index = None
 _cache_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Shared decoded-image cache (LRU, keyed by mhiiLink / img_id)
+# ---------------------------------------------------------------------------
+_IMAGE_CACHE_MAX = 500
+_image_cache: OrderedDict[int, tuple[Image.Image, tuple[int, int, int], dict]] = OrderedDict()
+_image_cache_lock = threading.Lock()
+
+
+def _image_cache_get(img_id: int):
+    """Return cached (pil_image, dcol, album_colors) or None. Thread-safe."""
+    with _image_cache_lock:
+        val = _image_cache.get(img_id)
+        if val is not None:
+            _image_cache.move_to_end(img_id)
+        return val
+
+
+def _image_cache_put(img_id: int, value):
+    """Store (pil_image, dcol, album_colors) in the LRU cache. Thread-safe."""
+    with _image_cache_lock:
+        _image_cache[img_id] = value
+        _image_cache.move_to_end(img_id)
+        while len(_image_cache) > _IMAGE_CACHE_MAX:
+            _image_cache.popitem(last=False)
+
+
+def clear_image_cache():
+    """Clear the decoded image cache (call on device change)."""
+    with _image_cache_lock:
+        _image_cache.clear()
 
 
 def _build_img_id_index(artworkdb_data):
@@ -46,6 +78,7 @@ def clear_artworkdb_cache():
         _artworkdb_cache = None
         _artworkdb_path_cache = None
         _img_id_index = None
+    clear_image_cache()
 
 
 def rgb565_to_rgb888_vectorized(pixels):
@@ -275,8 +308,13 @@ def getDominantColor(image):
     return (int(r * 255), int(g * 255), int(b * 255))
 
 
-def getAlbumColors(image):
+def getAlbumColors(image, bg=None):
     """Extract background + text colors from album artwork (iTunes 11 style).
+
+    Args:
+        image: PIL Image
+        bg: Optional pre-computed dominant color (r, g, b). If None,
+            getDominantColor(image) is called.
 
     Returns a dict with:
         bg:             (r, g, b) - dominant background color
@@ -285,7 +323,8 @@ def getAlbumColors(image):
     """
     import colorsys
 
-    bg = getDominantColor(image)
+    if bg is None:
+        bg = getDominantColor(image)
 
     # Get palette from the full image for text color candidates
     small = image.copy()
@@ -354,29 +393,20 @@ def _iter_entry_image_candidates(entry):
         yield area, result
 
 
-def find_image_by_img_id(artworkdb_data, ithmb_folder_path, img_id, img_id_index=None):
-    """Find and return image for the given img_id.
+def _decode_image_from_db(artworkdb_data, ithmb_folder_path, img_id, img_id_index=None):
+    """Decode the PIL image for img_id without color extraction.
 
-    Args:
-        artworkdb_data: Parsed ArtworkDB dict (from parse_artworkdb)
-        ithmb_folder_path: Path to the Artwork folder containing .ithmb files
-        img_id: The image ID to find
-        img_id_index: Optional pre-built index for O(1) lookup
-
-    Returns:
-        Tuple of (PIL.Image, dominant_color, album_colors) or None if not found
+    Returns PIL.Image or None.
     """
     if artworkdb_data is None:
         return None
 
-    # Use index for O(1) lookup if available
     if img_id_index is not None:
         entry = img_id_index.get(img_id)
         if entry is None:
             return None
         entries = [entry]
     else:
-        # Fallback to linear search if no index provided
         entries = [e for e in artworkdb_data.get("mhli", []) if e.get("img_id") == img_id]
 
     for entry in entries:
@@ -397,9 +427,50 @@ def find_image_by_img_id(artworkdb_data, ithmb_folder_path, img_id, img_id_index
             ithmb_path = os.path.join(ithmb_folder_path, ithmb_filename)
 
             img = generate_image(ithmb_path, image_result)
-            if img is None:
-                continue
+            if img is not None:
+                return img
 
-            dcol = getDominantColor(img)
-            album_colors = getAlbumColors(img)
-            return img, dcol, album_colors
+    return None
+
+
+def decode_image_by_img_id(artworkdb_data, ithmb_folder_path, img_id, img_id_index=None):
+    """Decode image only (no color extraction). Uses shared cache.
+
+    Returns PIL.Image or None.
+    """
+    cached = _image_cache_get(img_id)
+    if cached is not None:
+        return cached[0]
+
+    img = _decode_image_from_db(artworkdb_data, ithmb_folder_path, img_id, img_id_index)
+    # Don't cache decode-only results — let find_image_by_img_id populate the full entry
+    return img
+
+
+def find_image_by_img_id(artworkdb_data, ithmb_folder_path, img_id, img_id_index=None):
+    """Find and return image for the given img_id.
+
+    Args:
+        artworkdb_data: Parsed ArtworkDB dict (from parse_artworkdb)
+        ithmb_folder_path: Path to the Artwork folder containing .ithmb files
+        img_id: The image ID to find
+        img_id_index: Optional pre-built index for O(1) lookup
+
+    Returns:
+        Tuple of (PIL.Image, dominant_color, album_colors) or None if not found
+    """
+    # Check shared cache first
+    cached = _image_cache_get(img_id)
+    if cached is not None:
+        return cached
+
+    img = _decode_image_from_db(artworkdb_data, ithmb_folder_path, img_id, img_id_index)
+    if img is None:
+        return None
+
+    dcol = getDominantColor(img)
+    album_colors = getAlbumColors(img, bg=dcol)
+
+    result = (img, dcol, album_colors)
+    _image_cache_put(img_id, result)
+    return result

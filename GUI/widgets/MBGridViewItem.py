@@ -2,7 +2,6 @@ import logging
 from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from PyQt6.QtWidgets import QLabel, QFrame, QVBoxLayout
 from PyQt6.QtGui import QFont, QPixmap, QCursor, QImage
-from ..imgMaker import find_image_by_img_id, get_artworkdb_cached
 from ..hidpi import scale_pixmap_for_display
 from ..styles import Colors, FONT_FAMILY, Metrics
 from ..glyphs import glyph_pixmap
@@ -21,7 +20,6 @@ class MusicBrowserGridItem(QFrame):
         self.subtitle_text = subtitle
         self.mhiiLink = mhiiLink
         self.item_data = item_data or {"title": title, "subtitle": subtitle, "artwork_id_ref": mhiiLink}
-        self._destroyed = False  # Track if widget is being destroyed
 
         self.setFixedSize(QSize(Metrics.GRID_ITEM_W, Metrics.GRID_ITEM_H))
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -30,9 +28,6 @@ class MusicBrowserGridItem(QFrame):
         self.gridItemLayout = QVBoxLayout(self)
         self.gridItemLayout.setContentsMargins((10), (10), (10), (10))
         self.gridItemLayout.setSpacing((6))
-
-        self.worker = None
-        self._cancellation_token = None
 
         # Album art
         self.img_label = QLabel()
@@ -45,9 +40,7 @@ class MusicBrowserGridItem(QFrame):
         """)
         self.gridItemLayout.addWidget(self.img_label)
 
-        if mhiiLink is not None:
-            self.loadImage()
-        else:
+        if mhiiLink is None:
             self._setPlaceholderImage()
 
         # Title
@@ -86,7 +79,7 @@ class MusicBrowserGridItem(QFrame):
         if px:
             self.img_label.setPixmap(px)
         else:
-            self.img_label.setText("♪")
+            self.img_label.setText("\u266a")
             self.img_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_ICON_LG))
         self.img_label.setStyleSheet(f"""
             border: none;
@@ -95,100 +88,18 @@ class MusicBrowserGridItem(QFrame):
             color: {Colors.TEXT_TERTIARY};
         """)
 
-    def mousePressEvent(self, a0):
-        if a0 and a0.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self.item_data)
-        super().mousePressEvent(a0)
-
-    def cleanup(self):
-        """Mark widget as destroyed and cancel any pending work."""
-        self._destroyed = True
-        if self.worker:
-            self.worker.cancel()
-            try:
-                self.worker.signals.result.disconnect(self._applyImage)
-            except (TypeError, RuntimeError):
-                pass
-            self.worker = None
-
-    def loadImage(self):
-        from ..app import Worker, ThreadPoolSingleton, DeviceManager
-
-        if self.worker:
-            self.worker.cancel()
-
-        self._cancellation_token = DeviceManager.get_instance().cancellation_token
-
-        self.worker = Worker(self._loadImageData, self.mhiiLink)
-        self.worker.signals.result.connect(self._applyImage)
-        ThreadPoolSingleton.get_instance().start(self.worker)
-
-    def _loadImageData(self, mhiiLink):
-        """Load image data in worker thread."""
-        from ..app import DeviceManager
-        import os
-
-        device = DeviceManager.get_instance()
-
-        if device.cancellation_token.is_cancelled():
-            return None
-
-        if not device.device_path:
-            return None
-
-        artworkdb_path = device.artworkdb_path
-        artwork_folder = device.artwork_folder_path
-
-        if not artworkdb_path or not os.path.exists(artworkdb_path):
-            return None
-
-        if device.cancellation_token.is_cancelled():
-            return None
-
-        artworkdb_data, img_id_index = get_artworkdb_cached(artworkdb_path)
-
-        if device.cancellation_token.is_cancelled():
-            return None
-
-        result = find_image_by_img_id(artworkdb_data, artwork_folder, mhiiLink, img_id_index)
-
-        if result is None:
-            return {"error": True, "artwork_id_ref": mhiiLink}
-
-        pil_image, dcol, album_colors = result
-        return {"pil_image": pil_image, "dcol": dcol, "album_colors": album_colors}
-
-    def _applyImage(self, result):
-        """Apply loaded image data on main thread."""
-        if self._destroyed:
-            return
-
+    def applyImageResult(self, pil_image, dcol, album_colors):
+        """Apply a pre-loaded image result (called by MusicBrowserGrid)."""
         try:
             if not self.isVisible() and not self.parent():
                 return
         except RuntimeError:
             return
 
-        from ..app import DeviceManager
-
-        current_token = DeviceManager.get_instance().cancellation_token
-        if self._cancellation_token is not current_token:
-            return
-
-        if result is None or result.get("error"):
-            self._setPlaceholderImage()
-            return
-
-        pil_image = result.get("pil_image")
-        dcol = result.get("dcol")
-
         if pil_image is not None:
-            # Convert PIL image to QPixmap safely by copying the data
-            # ImageQt can cause crashes if PIL image goes out of scope
             pil_image = pil_image.convert("RGBA")
             data = pil_image.tobytes("raw", "RGBA")
             qimage = QImage(data, pil_image.width, pil_image.height, QImage.Format.Format_RGBA8888)
-            # Copy the QImage to own the data (prevents crash when data goes out of scope)
             qimage = qimage.copy()
             pixmap = scale_pixmap_for_display(
                 QPixmap.fromImage(qimage),
@@ -204,14 +115,11 @@ class MusicBrowserGridItem(QFrame):
                 border-radius: {Metrics.BORDER_RADIUS}px;
             """)
 
-            # Store dominant color and album colors for downstream use
             if dcol:
                 self.item_data["dominant_color"] = dcol
-            album_colors = result.get("album_colors")
             if album_colors:
                 self.item_data["album_colors"] = album_colors
 
-            # Tint background with dominant color
             if dcol:
                 r, g, b = dcol
                 self.setStyleSheet(f"""
@@ -226,3 +134,14 @@ class MusicBrowserGridItem(QFrame):
                         border: 1px solid rgba({r}, {g}, {b}, 45);
                     }}
                 """)
+        else:
+            self._setPlaceholderImage()
+
+    def mousePressEvent(self, a0):
+        if a0 and a0.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.item_data)
+        super().mousePressEvent(a0)
+
+    def cleanup(self):
+        """Mark widget for destruction (no-op now that loading is centralized)."""
+        pass

@@ -13,6 +13,12 @@ iPod hardware limits enforced on every output:
   Bit depth    ≤ 16-bit   (ALAC only — AAC/MP3 are inherently ≤16-bit)
 """
 
+from ._formats import (
+    IPOD_NATIVE_FORMATS,
+    NON_NATIVE_LOSSLESS as _NON_NATIVE_LOSSLESS_EXTS,
+    NON_NATIVE_LOSSY as _NON_NATIVE_LOSSY_EXTS,
+    NON_NATIVE_VIDEO as _NON_NATIVE_VIDEO_EXTS,
+)
 import json as _json
 import logging
 import shutil
@@ -53,13 +59,6 @@ class TranscodeTarget(Enum):
     COPY = "copy"
 
 
-# Extension sets — used by the target-resolution logic
-_NON_NATIVE_LOSSLESS_EXTS = frozenset({".flac", ".wav", ".aif", ".aiff"})
-_NON_NATIVE_LOSSY_EXTS = frozenset({".ogg", ".opus", ".wma"})
-_NON_NATIVE_VIDEO_EXTS = frozenset({".mov", ".mkv", ".avi"})
-IPOD_NATIVE_FORMATS = frozenset({".mp3", ".mp4", ".aac", ".m4a", ".m4b", ".m4p", ".m4v"})
-
-
 _OUTPUT_EXT: dict[TranscodeTarget, str] = {
     TranscodeTarget.ALAC: ".m4a",
     TranscodeTarget.AAC: ".m4a",
@@ -84,6 +83,13 @@ class TranscodeResult:
         if self.output_path:
             return self.output_path.suffix.lstrip(".")
         return self.source_path.suffix.lstrip(".")
+
+
+def clear_caches() -> None:
+    """Clear cached settings/binary lookups. Call at the start of each sync."""
+    _find_ffprobe.cache_clear()
+    _read_prefer_lossy.cache_clear()
+    _read_audio_settings.cache_clear()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -125,6 +131,7 @@ def is_ffmpeg_available() -> bool:
     return find_ffmpeg() is not None
 
 
+@lru_cache(maxsize=1)
 def _find_ffprobe() -> Optional[str]:
     """Locate ffprobe (sibling of ffmpeg, then PATH)."""
     ffmpeg = find_ffmpeg()
@@ -301,6 +308,7 @@ def _probe_duration_us(filepath: str | Path) -> int:
 # Target resolution — "what should this file become?"
 # ═══════════════════════════════════════════════════════════════════════════
 
+@lru_cache(maxsize=1)
 def _read_prefer_lossy() -> bool:
     try:
         from settings import get_settings
@@ -309,6 +317,7 @@ def _read_prefer_lossy() -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
 def _read_audio_settings() -> tuple[bool, bool, bool]:
     """Return ``(normalize_sample_rate, mono_for_spoken, smart_quality_by_type)``
     from settings, with safe defaults if settings are unavailable."""
@@ -622,6 +631,7 @@ def _cmd_video(
         "-ar", str(IPOD_MAX_SAMPLE_RATE),
         "-b:a", "160k",
         "-movflags", "+faststart",
+        "-f", "ipod",
         "-y", dst,
     ]
 
@@ -639,6 +649,7 @@ def transcode(
     progress_callback: Optional[Callable[[float], None]] = None,
     *,
     prefer_lossy: Optional[bool] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> TranscodeResult:
     """Transcode (or copy) *source_path* into *output_dir*.
 
@@ -720,7 +731,8 @@ def transcode(
     else:
         cmd = _cmd_video(ffmpeg, src, dst, effective_quality, crf, preset)
 
-    return _run_transcode(cmd, source_path, out, target, progress_callback)
+    return _run_transcode(cmd, source_path, out, target, progress_callback,
+                          is_cancelled=is_cancelled)
 
 
 def _run_transcode(
@@ -729,6 +741,7 @@ def _run_transcode(
     output_path: Path,
     target: TranscodeTarget,
     progress_callback: Optional[Callable[[float], None]],
+    is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> TranscodeResult:
     """Run an ffmpeg command and return a TranscodeResult."""
     try:
@@ -739,15 +752,52 @@ def _run_transcode(
             dur = _probe_duration_us(source_path)
             returncode, stderr = _run_ffmpeg_with_progress(
                 cmd, dur, progress_callback, timeout,
+                is_cancelled=is_cancelled,
             )
             progress_callback(1.0)
         else:
-            r = subprocess.run(
-                cmd, capture_output=True, text=True,
-                encoding="utf-8", errors="replace",
-                timeout=timeout, **_SP_KWARGS,
+            # Audio transcodes: run via Popen so we can kill on cancel.
+            # stdout is unused; stderr must be drained in a thread to
+            # prevent a deadlock on Windows where small pipe buffers
+            # (4 KB) fill up and block ffmpeg when multiple workers run
+            # in parallel.
+            import threading as _threading
+
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                **_SP_KWARGS,
             )
-            returncode, stderr = r.returncode, r.stderr
+            stderr_chunks: list[bytes] = []
+
+            def _drain_stderr() -> None:
+                pipe = proc.stderr
+                if pipe is None:
+                    return
+                for chunk in iter(lambda: pipe.read(4096), b""):
+                    stderr_chunks.append(chunk)
+
+            drain_t = _threading.Thread(target=_drain_stderr, daemon=True)
+            drain_t.start()
+
+            # Poll so we can check cancellation every 0.5s
+            while proc.poll() is None:
+                if is_cancelled and is_cancelled():
+                    proc.kill()
+                    proc.wait(timeout=5)
+                    drain_t.join(timeout=5)
+                    return TranscodeResult(
+                        success=False, source_path=source_path,
+                        output_path=None, target_format=target,
+                        was_transcoded=True, error_message="Cancelled",
+                    )
+                try:
+                    proc.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    pass
+
+            drain_t.join(timeout=10)
+            returncode = proc.returncode
+            stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
         if returncode != 0:
             return TranscodeResult(
@@ -785,6 +835,7 @@ def _run_ffmpeg_with_progress(
     duration_us: int,
     progress_callback: Callable[[float], None],
     timeout: int,
+    is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> tuple[int, str]:
     """Run ffmpeg with ``-progress pipe:1`` and stream progress."""
     import threading
@@ -812,6 +863,10 @@ def _run_ffmpeg_with_progress(
         deadline = time.monotonic() + timeout
         assert proc.stdout is not None
         for line in proc.stdout:
+            if is_cancelled and is_cancelled():
+                proc.kill()
+                t.join(timeout=5)
+                return -1, "Cancelled"
             if time.monotonic() > deadline:
                 proc.kill()
                 return -1, "Transcoding timed out"

@@ -178,6 +178,9 @@ class SyncPlan:
     # Storage
     storage: StorageSummary = field(default_factory=StorageSummary)
 
+    # When True, removal cards in sync review start checked (used by "Remove from iPod" context menu)
+    removals_pre_checked: bool = False
+
     @property
     def has_changes(self) -> bool:
         return any([
