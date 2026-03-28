@@ -767,9 +767,9 @@ class PCLibrary:
             if hasattr(audio.info, "length"):
                 metadata["duration_ms"] = int(audio.info.length * 1000)
             if hasattr(audio.info, "bitrate"):
-                metadata["bitrate"] = audio.info.bitrate // 1000 if audio.info.bitrate else None
+                metadata["bitrate"] = int(audio.info.bitrate) // 1000 if audio.info.bitrate else None
             if hasattr(audio.info, "sample_rate"):
-                metadata["sample_rate"] = audio.info.sample_rate
+                metadata["sample_rate"] = int(audio.info.sample_rate)
 
         # Handle different tag formats
         if ext == ".mp3":

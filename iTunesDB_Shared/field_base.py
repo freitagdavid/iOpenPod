@@ -371,7 +371,23 @@ def write_field(
             raise InvalidFieldValueError(
                 section_type or field.section_type, field.name, str(exc),
             ) from exc
-    struct.pack_into(field.struct_format, buffer, base_offset + field.offset, value)
+    # Coerce to the type required by the format code so that floats or other
+    # numeric types from metadata sources never reach struct.pack_into as the
+    # wrong type (e.g. float for an integer field, or int for a float field).
+    _fmt = field.struct_format[-1]
+    if _fmt in 'IiHhQqBbNnP':
+        if not isinstance(value, int):
+            value = int(value)
+    elif _fmt in 'fd':
+        if not isinstance(value, float):
+            value = float(value)
+    try:
+        struct.pack_into(field.struct_format, buffer, base_offset + field.offset, value)
+    except struct.error as exc:
+        raise struct.error(
+            f"Failed to pack field '{field.name}' (format={field.struct_format!r}, "
+            f"value={value!r} type={type(value).__name__}): {exc}"
+        ) from exc
 
 
 def write_fields(

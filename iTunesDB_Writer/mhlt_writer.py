@@ -38,7 +38,12 @@ def write_mhlt(tracks: List[TrackInfo], start_track_id: int, db_id_2: int, capab
     track_id = start_track_id
 
     for track in tracks:
-        mhit_data = write_mhit(track, track_id, db_id_2, capabilities=capabilities)
+        try:
+            mhit_data = write_mhit(track, track_id, db_id_2, capabilities=capabilities)
+        except Exception as exc:
+            raise type(exc)(
+                f"{exc} (track #{track_id}: {track.artist!r} – {track.title!r})"
+            ) from exc
         track_chunks.append(mhit_data)
         track_id += 1
 
