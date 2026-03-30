@@ -12,7 +12,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import tempfile
+import time
 
 from .models import PodcastFeed
 
@@ -84,7 +86,18 @@ class SubscriptionStore:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, self._json_path)
+            # On Windows, antivirus / Explorer / indexer can briefly lock
+            # the target file, causing os.replace() to fail with
+            # PermissionError.  Retry a few times before giving up.
+            last_err: Exception | None = None
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, self._json_path)
+                    break
+                except PermissionError:
+                    if sys.platform != "win32" or attempt == 4:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
         except Exception:
             try:
                 os.remove(tmp)

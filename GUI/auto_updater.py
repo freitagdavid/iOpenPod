@@ -360,19 +360,44 @@ def _write_unix_bootstrap(
         copy_cmd = f'cp -a "{staged_dir}/." "{app_dir}/"'
         post_copy = f'chmod +x "{app_dir}/{exe_name}"\n'
 
+    log_file = Path(tempfile.gettempdir()) / "_iopenpod_update.log"
+
     script.write_text(
         f'#!/bin/sh\n'
+        f'LOG="{log_file}"\n'
+        f'exec >> "$LOG" 2>&1\n'
+        f'echo "=== iOpenPod updater started $(date) ==="\n'
+        f'echo "App dir:    {app_dir}"\n'
+        f'echo "Staged dir: {staged_dir}"\n'
+        f'echo "Exe name:   {exe_name}"\n'
+        f'echo "PID:        {pid}"\n'
+        f'\n'
         f'echo "Waiting for iOpenPod to exit..."\n'
         f'while kill -0 {pid} 2>/dev/null; do sleep 1; done\n'
+        f'echo "Process exited."\n'
+        f'sleep 1\n'
+        f'\n'
         f'echo "Applying update..."\n'
         f'rm -rf "{app_dir}.bak"\n'
-        f'mv "{app_dir}" "{app_dir}.bak"\n'
-        f'{copy_cmd}\n'
+        f'if ! mv "{app_dir}" "{app_dir}.bak"; then\n'
+        f'    echo "ERROR: mv failed — cannot move old app aside"\n'
+        f'    exit 1\n'
+        f'fi\n'
+        f'echo "Old app moved to .bak"\n'
+        f'\n'
+        f'if ! {copy_cmd}; then\n'
+        f'    echo "ERROR: copy failed — restoring backup"\n'
+        f'    mv "{app_dir}.bak" "{app_dir}"\n'
+        f'    exit 1\n'
+        f'fi\n'
+        f'echo "New files copied"\n'
+        f'\n'
         f'{post_copy}'
         f'echo "Restarting iOpenPod..."\n'
         f'"{app_dir}/{exe_name}" &\n'
         f'rm -rf "{app_dir}.bak"\n'
         f'rm -rf "{staged_dir.parent}"\n'
+        f'echo "=== Update complete $(date) ==="\n'
         f'rm -f "$0"\n',
         encoding="utf-8",
     )
@@ -425,7 +450,9 @@ def launch_bootstrap_and_exit(staged_dir: Path) -> bool:
             subprocess.Popen(
                 ["/bin/sh", str(script)],
                 start_new_session=True,
-                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
 
         logger.info("Bootstrap launched: %s — app should exit now.", script)
