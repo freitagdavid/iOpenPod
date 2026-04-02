@@ -87,7 +87,10 @@ def _jump_table_letter(s: str) -> int:
         if ch.isalnum():
             if ch.isdigit():
                 return ord('0')
-            return ord(ch.upper()[0])
+            upper = ord(ch.upper()[0])
+            if upper > 0xFFFF:
+                continue  # non-BMP char can't fit in UTF-16 jump table
+            return upper
 
     return ord('0')
 
